@@ -2,8 +2,8 @@
 //!
 //! The model used by the camera is OpenCV Zoo's Apache-2.0 SFace model, a
 //! MobileFaceNet instance trained with the SFace loss. Geometry tracking and
-//! identity recognition intentionally remain separate: the camera only sends a
-//! small aligned face tensor when it encounters a new tracking ID.
+//! identity recognition intentionally remain separate: the camera sends a few
+//! quality-scored aligned face tensors when it encounters a new tracking ID.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -37,6 +37,10 @@ const DATABASE_SCHEMA_VERSION: i64 = 3;
 const EMBEDDING_FORMAT: &str = "f32-le-l2-v1";
 const CAPTURE_SAMPLES_PER_POSE: usize = 3;
 const CAPTURE_HOLD_DURATION: Duration = Duration::from_millis(350);
+const QUERY_MIN_SAMPLES: usize = 3;
+const QUERY_MAX_SAMPLES: usize = 5;
+const QUERY_SAMPLE_INTERVAL: Duration = Duration::from_millis(90);
+const QUERY_CONSISTENCY_THRESHOLD: f32 = 0.55;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaceIdDatabaseMode {
@@ -87,6 +91,17 @@ impl CapturePose {
         }
     }
 
+    fn from_database_label(label: &str) -> Option<Self> {
+        match label {
+            "center" => Some(Self::Center),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            _ => None,
+        }
+    }
+
     fn instruction(self) -> &'static str {
         match self {
             Self::Center => "LOOK STRAIGHT",
@@ -127,13 +142,54 @@ pub struct FaceCaptureRequest {
 struct FaceIdJob {
     track_id: u64,
     tensor: Vec<f32>,
+    query: Option<FaceQuerySample>,
     capture: Option<FaceCaptureRequest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaceQueryPose {
+    Center,
+    Horizontal,
+    Vertical,
+    Unknown,
+}
+
+impl FaceQueryPose {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::Horizontal => "horizontal",
+            Self::Vertical => "vertical",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn accepts(self, template: CapturePose) -> bool {
+        match self {
+            Self::Center => template == CapturePose::Center,
+            Self::Horizontal => matches!(template, CapturePose::Left | CapturePose::Right),
+            Self::Vertical => matches!(template, CapturePose::Up | CapturePose::Down),
+            Self::Unknown => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FaceQuerySample {
+    pose: FaceQueryPose,
+    quality: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QuerySubmissionState {
+    submitted: usize,
+    last_submitted: Instant,
 }
 
 /// A non-blocking handle to the dedicated embedding worker.
 pub struct FaceIdClient {
     sender: mpsc::SyncSender<FaceIdJob>,
-    submitted_tracks: Mutex<HashSet<u64>>,
+    submitted_tracks: Mutex<HashMap<u64, QuerySubmissionState>>,
     results: Arc<Mutex<HashMap<u64, FaceIdentityMatch>>>,
     capture: Option<Arc<Mutex<GuidedCaptureState>>>,
 }
@@ -186,45 +242,80 @@ impl FaceIdClient {
 
         Ok(Arc::new(Self {
             sender,
-            submitted_tracks: Mutex::new(HashSet::new()),
+            submitted_tracks: Mutex::new(HashMap::new()),
             results,
             capture,
         }))
     }
 
-    /// Queues at most one embedding attempt for a tracking ID. A full queue is
-    /// harmless: the track is left unmarked so a later frame can retry.
-    pub fn try_submit(&self, track_id: u64, tensor: Vec<f32>) {
+    /// Queues several spaced, quality-scored observations for a tracking ID.
+    /// A full queue is harmless: that sample is left unmarked so a later frame
+    /// can retry without building latency behind the live preview.
+    pub fn try_submit(&self, track_id: u64, tensor: Vec<f32>, face: &FaceGeometry, now: Instant) {
+        let Some(query) = query_sample(face, &tensor) else {
+            return;
+        };
         let mut submitted = self
             .submitted_tracks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if submitted.contains(&track_id) {
+        if submitted.get(&track_id).is_some_and(|state| {
+            state.submitted >= QUERY_MAX_SAMPLES
+                || now.duration_since(state.last_submitted) < QUERY_SAMPLE_INTERVAL
+        }) {
             return;
         }
 
         match self.sender.try_send(FaceIdJob {
             track_id,
             tensor,
+            query: Some(query),
             capture: None,
         }) {
             Ok(()) => {
-                submitted.insert(track_id);
+                submitted
+                    .entry(track_id)
+                    .and_modify(|state| {
+                        state.submitted += 1;
+                        state.last_submitted = now;
+                    })
+                    .or_insert(QuerySubmissionState {
+                        submitted: 1,
+                        last_submitted: now,
+                    });
             }
             Err(mpsc::TrySendError::Full(_)) => {}
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 eprintln!("face-ID worker stopped unexpectedly");
-                submitted.insert(track_id);
+                submitted.insert(
+                    track_id,
+                    QuerySubmissionState {
+                        submitted: QUERY_MAX_SAMPLES,
+                        last_submitted: now,
+                    },
+                );
             }
         }
     }
 
-    pub fn wants_track(&self, track_id: u64) -> bool {
-        !self
-            .submitted_tracks
+    pub fn wants_track(&self, track_id: u64, face: &FaceGeometry, now: Instant) -> bool {
+        if !query_geometry_is_acceptable(face)
+            || self
+                .results
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&track_id)
+        {
+            return false;
+        }
+        self.submitted_tracks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&track_id)
+            .get(&track_id)
+            .is_none_or(|state| {
+                state.submitted < QUERY_MAX_SAMPLES
+                    && now.duration_since(state.last_submitted) >= QUERY_SAMPLE_INTERVAL
+            })
     }
 
     pub fn identity_for_track(&self, track_id: u64) -> Option<FaceIdentityMatch> {
@@ -266,6 +357,7 @@ impl FaceIdClient {
         match self.sender.try_send(FaceIdJob {
             track_id,
             tensor,
+            query: None,
             capture: Some(capture_request),
         }) {
             Ok(()) => {}
@@ -469,6 +561,132 @@ fn capture_quality(face: &FaceGeometry) -> f32 {
         .clamp(0.0, 1.0)
 }
 
+fn query_geometry_is_acceptable(face: &FaceGeometry) -> bool {
+    let area = face.bounding_box.width * face.bounding_box.height;
+    face.confidence >= 0.72
+        && face.landmark_confidence >= 0.65
+        && area >= 0.012
+        && face
+            .roll_radians
+            .is_none_or(|roll| roll.to_degrees().abs() <= 30.0)
+        && face
+            .yaw_radians
+            .is_none_or(|yaw| yaw.to_degrees().abs() <= 50.0)
+        && region_center(face, LandmarkKind::LeftEye).is_some()
+        && region_center(face, LandmarkKind::RightEye).is_some()
+        && region_center(face, LandmarkKind::Nose)
+            .or_else(|| region_center(face, LandmarkKind::NoseCrest))
+            .is_some()
+        && region_center(face, LandmarkKind::OuterLips).is_some()
+}
+
+fn query_sample(face: &FaceGeometry, tensor: &[f32]) -> Option<FaceQuerySample> {
+    if !query_geometry_is_acceptable(face) {
+        return None;
+    }
+    let image_quality = aligned_tensor_quality(tensor)?;
+    let quality =
+        (capture_quality(face) * 0.55 + eye_openness_quality(face) * 0.20 + image_quality * 0.25)
+            .clamp(0.0, 1.0);
+    Some(FaceQuerySample {
+        pose: classify_query_pose(face),
+        quality,
+    })
+}
+
+fn classify_query_pose(face: &FaceGeometry) -> FaceQueryPose {
+    let yaw = face.yaw_radians.map(|value| value.to_degrees().abs());
+    if yaw.is_some_and(|value| value >= 15.0) {
+        return FaceQueryPose::Horizontal;
+    }
+    let pitch = face
+        .pitch_radians
+        .map(|value| value.to_degrees().abs())
+        .or_else(|| landmark_pitch_degrees(face).map(f64::abs));
+    if yaw.is_none_or(|value| value <= 15.0) && pitch.is_some_and(|value| value >= 12.0) {
+        FaceQueryPose::Vertical
+    } else if yaw.is_some_and(|value| value <= 15.0) && pitch.is_none_or(|value| value < 12.0) {
+        FaceQueryPose::Center
+    } else {
+        FaceQueryPose::Unknown
+    }
+}
+
+fn eye_openness_quality(face: &FaceGeometry) -> f32 {
+    [LandmarkKind::LeftEye, LandmarkKind::RightEye]
+        .into_iter()
+        .filter_map(|kind| {
+            let region = face.landmarks.iter().find(|region| region.kind == kind)?;
+            if region.points.len() < 3 {
+                return None;
+            }
+            let min_x = region
+                .points
+                .iter()
+                .map(|point| point.x)
+                .fold(f64::INFINITY, f64::min);
+            let max_x = region
+                .points
+                .iter()
+                .map(|point| point.x)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_y = region
+                .points
+                .iter()
+                .map(|point| point.y)
+                .fold(f64::INFINITY, f64::min);
+            let max_y = region
+                .points
+                .iter()
+                .map(|point| point.y)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let width = max_x - min_x;
+            (width > f64::EPSILON)
+                .then_some((((max_y - min_y) / width) / 0.22).clamp(0.0, 1.0) as f32)
+        })
+        .reduce(f32::min)
+        .unwrap_or(0.65)
+}
+
+fn aligned_tensor_quality(tensor: &[f32]) -> Option<f32> {
+    let plane = SFACE_WIDTH * SFACE_HEIGHT;
+    if tensor.len() != plane * 3 || tensor.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let luminance = |offset: usize| {
+        tensor[offset] * 0.299 + tensor[plane + offset] * 0.587 + tensor[plane * 2 + offset] * 0.114
+    };
+    let mut sum = 0.0_f32;
+    let mut squared_sum = 0.0_f32;
+    for offset in 0..plane {
+        let value = luminance(offset);
+        sum += value;
+        squared_sum += value * value;
+    }
+    let mean = sum / plane as f32;
+    let variance = (squared_sum / plane as f32 - mean * mean).max(0.0);
+    let deviation = variance.sqrt();
+    if !(18.0..=242.0).contains(&mean) || deviation < 8.0 {
+        return None;
+    }
+
+    let mut gradient_sum = 0.0_f32;
+    let mut gradient_count = 0usize;
+    for y in 1..SFACE_HEIGHT - 1 {
+        for x in 1..SFACE_WIDTH - 1 {
+            let offset = y * SFACE_WIDTH + x;
+            gradient_sum += (luminance(offset + 1) - luminance(offset - 1)).abs();
+            gradient_sum +=
+                (luminance(offset + SFACE_WIDTH) - luminance(offset - SFACE_WIDTH)).abs();
+            gradient_count += 2;
+        }
+    }
+    let mean_gradient = gradient_sum / gradient_count as f32;
+    let contrast_score = ((deviation - 8.0) / 42.0).clamp(0.0, 1.0);
+    let detail_score = ((mean_gradient - 2.0) / 18.0).clamp(0.0, 1.0);
+    Some((contrast_score * 0.55 + detail_score * 0.45).clamp(0.0, 1.0))
+}
+
 fn vertical_pose_proxy(face: &FaceGeometry) -> Option<f64> {
     let left_eye = region_center(face, LandmarkKind::LeftEye)?;
     let right_eye = region_center(face, LandmarkKind::RightEye)?;
@@ -628,7 +846,12 @@ fn run_worker(
     capture: Option<Arc<Mutex<GuidedCaptureState>>>,
 ) {
     let mut captured_samples = Vec::new();
+    let mut query_tracks = HashMap::<u64, Vec<QueryEmbeddingSample>>::new();
+    let mut completed_tracks = HashSet::<u64>::new();
     for job in receiver {
+        if job.capture.is_none() && completed_tracks.contains(&job.track_id) {
+            continue;
+        }
         match engine.embed(job.tensor) {
             Ok(embedding) if job.capture.is_some() => {
                 let request = job.capture.expect("capture request checked");
@@ -679,42 +902,40 @@ fn run_worker(
                     }
                 }
             }
-            Ok(embedding) => match gallery.identify(embedding) {
-                Ok(result) => {
-                    let display_name = result.display_name();
-                    if result.is_new {
-                        if result.persisted {
-                            println!(
-                                "face-id track={} person={} name={:?} similarity=new best={:.3} fingerprint={}",
-                                job.track_id,
-                                result.person_id,
-                                display_name,
-                                result.similarity,
-                                result.fingerprint
-                            );
-                        } else {
-                            println!(
-                                "face-id track={} person=unknown similarity=unmatched best={:.3} fingerprint={}",
-                                job.track_id, result.similarity, result.fingerprint
-                            );
-                        }
-                    } else {
-                        println!(
-                            "face-id track={} person={} name={:?} similarity={:.3} fingerprint={}",
-                            job.track_id,
-                            result.person_id,
-                            display_name,
-                            result.similarity,
-                            result.fingerprint
-                        );
+            Ok(embedding) => {
+                let Some(query) = job.query else {
+                    eprintln!("face-id track={} missing query metadata", job.track_id);
+                    continue;
+                };
+                let samples = query_tracks.entry(job.track_id).or_default();
+                samples.push(QueryEmbeddingSample {
+                    embedding,
+                    pose: query.pose,
+                    quality: query.quality,
+                });
+                let force = samples.len() >= QUERY_MAX_SAMPLES;
+                let Some(aggregate) = aggregate_query_samples(samples, force) else {
+                    continue;
+                };
+                match gallery.identify_query(
+                    aggregate.embedding.clone(),
+                    aggregate.pose,
+                    aggregate.samples_used,
+                ) {
+                    Ok(result) => {
+                        log_identity_result(job.track_id, &result, &aggregate);
+                        results
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(job.track_id, result);
+                        query_tracks.remove(&job.track_id);
+                        completed_tracks.insert(job.track_id);
                     }
-                    results
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert(job.track_id, result);
+                    Err(error) => {
+                        eprintln!("face-id track={} database error: {error}", job.track_id)
+                    }
                 }
-                Err(error) => eprintln!("face-id track={} database error: {error}", job.track_id),
-            },
+            }
             Err(error) => {
                 if job.capture.is_some() {
                     if let Some(capture) = &capture {
@@ -731,6 +952,121 @@ fn run_worker(
 }
 
 #[derive(Debug)]
+struct QueryEmbeddingSample {
+    embedding: Vec<f32>,
+    pose: FaceQueryPose,
+    quality: f32,
+}
+
+#[derive(Debug)]
+struct AggregatedFaceQuery {
+    embedding: Vec<f32>,
+    pose: FaceQueryPose,
+    samples_used: usize,
+    observations: usize,
+    consistency: f32,
+    quality: f32,
+}
+
+fn aggregate_query_samples(
+    samples: &[QueryEmbeddingSample],
+    force: bool,
+) -> Option<AggregatedFaceQuery> {
+    if samples.len() < QUERY_MIN_SAMPLES {
+        return None;
+    }
+    let mut best: Option<([usize; QUERY_MIN_SAMPLES], f32, f32, f32)> = None;
+    for first in 0..samples.len() - 2 {
+        for second in first + 1..samples.len() - 1 {
+            for third in second + 1..samples.len() {
+                let indices = [first, second, third];
+                let similarities = [
+                    cosine_similarity(&samples[first].embedding, &samples[second].embedding),
+                    cosine_similarity(&samples[first].embedding, &samples[third].embedding),
+                    cosine_similarity(&samples[second].embedding, &samples[third].embedding),
+                ];
+                let consistency = similarities.into_iter().fold(f32::INFINITY, f32::min);
+                let mean_similarity = similarities.into_iter().sum::<f32>() / 3.0;
+                let quality = indices
+                    .into_iter()
+                    .map(|index| samples[index].quality)
+                    .sum::<f32>()
+                    / QUERY_MIN_SAMPLES as f32;
+                let score = mean_similarity * 0.9 + quality * 0.1;
+                if best.is_none_or(|(_, best_score, _, _)| score > best_score) {
+                    best = Some((indices, score, consistency, quality));
+                }
+            }
+        }
+    }
+    let (indices, _, consistency, quality) = best?;
+    if !force && consistency < QUERY_CONSISTENCY_THRESHOLD {
+        return None;
+    }
+    let embedding = mean_embedding(
+        indices
+            .into_iter()
+            .map(|index| samples[index].embedding.as_slice()),
+    )
+    .ok()?;
+    let pose = majority_query_pose(indices.map(|index| samples[index].pose));
+    Some(AggregatedFaceQuery {
+        embedding,
+        pose,
+        samples_used: QUERY_MIN_SAMPLES,
+        observations: samples.len(),
+        consistency,
+        quality,
+    })
+}
+
+fn majority_query_pose(poses: [FaceQueryPose; QUERY_MIN_SAMPLES]) -> FaceQueryPose {
+    poses
+        .into_iter()
+        .find(|candidate| poses.iter().filter(|pose| *pose == candidate).count() >= 2)
+        .unwrap_or(FaceQueryPose::Unknown)
+}
+
+fn log_identity_result(track_id: u64, result: &FaceIdentityMatch, aggregate: &AggregatedFaceQuery) {
+    let evidence = format!(
+        "frames={}/{} consistency={:.3} quality={:.2} pose={}",
+        aggregate.samples_used,
+        aggregate.observations,
+        aggregate.consistency,
+        aggregate.quality,
+        aggregate.pose.label()
+    );
+    if result.is_new {
+        if result.persisted {
+            println!(
+                "face-id track={} person={} name={:?} similarity=new best={:.3} fingerprint={} {}",
+                track_id,
+                result.person_id,
+                result.display_name(),
+                result.similarity,
+                result.fingerprint,
+                evidence
+            );
+        } else {
+            println!(
+                "face-id track={} person=unknown similarity=unmatched best={:.3} fingerprint={} {}",
+                track_id, result.similarity, result.fingerprint, evidence
+            );
+        }
+    } else {
+        println!(
+            "face-id track={} person={} name={:?} similarity={:.3} fingerprint={} {}",
+            track_id,
+            result.person_id,
+            result.display_name(),
+            result.similarity,
+            result.fingerprint,
+            evidence
+        );
+    }
+}
+
+#[derive(Debug)]
 struct CapturedFaceSample {
     pose: CapturePose,
     embedding: Vec<f32>,
@@ -742,9 +1078,15 @@ struct Identity {
     id: u64,
     name: Option<String>,
     centroid: Vec<f32>,
-    pose_templates: Vec<Vec<f32>>,
+    pose_templates: Vec<PoseTemplate>,
     samples: u32,
     fingerprint: String,
+}
+
+#[derive(Debug)]
+struct PoseTemplate {
+    pose: CapturePose,
+    embedding: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -938,62 +1280,30 @@ impl IdentityGallery {
         })
     }
 
+    #[cfg(test)]
     fn identify(&mut self, embedding: Vec<f32>) -> Result<FaceIdentityMatch, String> {
+        self.identify_query(embedding, FaceQueryPose::Unknown, 1)
+    }
+
+    fn identify_query(
+        &mut self,
+        embedding: Vec<f32>,
+        query_pose: FaceQueryPose,
+        source_samples: usize,
+    ) -> Result<FaceIdentityMatch, String> {
         let best = self
             .identities
             .iter()
             .enumerate()
-            .map(|(index, identity)| {
-                let similarity = std::iter::once(identity.centroid.as_slice())
-                    .chain(identity.pose_templates.iter().map(Vec::as_slice))
-                    .map(|template| cosine_similarity(template, &embedding))
-                    .max_by(f32::total_cmp)
-                    .unwrap_or(f32::NEG_INFINITY);
-                (index, similarity)
-            })
+            .map(|(index, identity)| (index, identity_similarity(identity, &embedding, query_pose)))
             .max_by(|left, right| left.1.total_cmp(&right.1));
 
         if let Some((index, similarity)) =
             best.filter(|(_, score)| *score >= SFACE_COSINE_THRESHOLD)
         {
-            let identity = &mut self.identities[index];
-            if self.writable {
-                let database_display = self.database_path.display().to_string();
-                let samples = identity.samples.saturating_add(1);
-                // Slowly adapt to lighting/pose while keeping the original fingerprint stable.
-                let mut centroid = identity.centroid.clone();
-                for (centroid, sample) in centroid.iter_mut().zip(&embedding) {
-                    *centroid = *centroid * 0.85 + *sample * 0.15;
-                }
-                let norm = centroid
-                    .iter()
-                    .map(|value| value * value)
-                    .sum::<f32>()
-                    .sqrt();
-                if norm > f32::EPSILON {
-                    for value in &mut centroid {
-                        *value /= norm;
-                    }
-                }
-                self.connection
-                    .execute(
-                        "UPDATE face_identities
-                         SET centroid = ?1, embedding_dim = ?2, samples = ?3,
-                             updated_at = CURRENT_TIMESTAMP
-                         WHERE person_id = ?4",
-                        params![
-                            embedding_to_blob(&centroid),
-                            centroid.len() as i64,
-                            samples as i64,
-                            identity.id as i64
-                        ],
-                    )
-                    .map_err(|error| {
-                        format!("could not update identity in {database_display}: {error}")
-                    })?;
-                identity.centroid = centroid;
-                identity.samples = samples;
-            }
+            // Ordinary recognition never rewrites a biometric template. Gallery
+            // changes are deliberate (--capture) or a consensus-backed new enrollment.
+            let identity = &self.identities[index];
             return Ok(FaceIdentityMatch {
                 person_id: identity.id,
                 name: identity.name.clone(),
@@ -1019,11 +1329,12 @@ impl IdentityGallery {
             .execute(
                 "INSERT INTO face_identities
                  (fingerprint, centroid, embedding_dim, samples)
-                 VALUES (?1, ?2, ?3, 1)",
+                 VALUES (?1, ?2, ?3, ?4)",
                 params![
                     &fingerprint,
                     embedding_to_blob(&embedding),
-                    embedding.len() as i64
+                    embedding.len() as i64,
+                    source_samples.max(1) as i64
                 ],
             )
             .map_err(|error| self.database_error("insert identity", error))?;
@@ -1034,7 +1345,7 @@ impl IdentityGallery {
             fingerprint,
             centroid: embedding,
             pose_templates: Vec::new(),
-            samples: 1,
+            samples: source_samples.max(1) as u32,
         };
         let result = FaceIdentityMatch {
             person_id: identity.id,
@@ -1192,6 +1503,20 @@ impl IdentityGallery {
             self.database_path.display()
         )
     }
+}
+
+fn identity_similarity(identity: &Identity, embedding: &[f32], query_pose: FaceQueryPose) -> f32 {
+    std::iter::once(identity.centroid.as_slice())
+        .chain(
+            identity
+                .pose_templates
+                .iter()
+                .filter(|template| query_pose.accepts(template.pose))
+                .map(|template| template.embedding.as_slice()),
+        )
+        .map(|template| cosine_similarity(template, embedding))
+        .max_by(f32::total_cmp)
+        .unwrap_or(f32::NEG_INFINITY)
 }
 
 fn validate_metadata(connection: &Connection, key: &str, expected: &str) -> Result<(), String> {
@@ -1355,7 +1680,10 @@ fn load_identities(connection: &Connection) -> Result<Vec<Identity>, String> {
     Ok(identities)
 }
 
-fn load_pose_templates(connection: &Connection, person_id: u64) -> Result<Vec<Vec<f32>>, String> {
+fn load_pose_templates(
+    connection: &Connection,
+    person_id: u64,
+) -> Result<Vec<PoseTemplate>, String> {
     let mut statement = connection
         .prepare(
             "SELECT pose, embedding, embedding_dim
@@ -1386,8 +1714,15 @@ fn load_pose_templates(connection: &Connection, person_id: u64) -> Result<Vec<Ve
             .push(embedding_from_blob(&blob, dimension as usize)?);
     }
     grouped
-        .into_values()
-        .map(|samples| mean_embedding(samples.iter().map(Vec::as_slice)))
+        .into_iter()
+        .map(|(pose, samples)| {
+            let pose = CapturePose::from_database_label(&pose)
+                .ok_or_else(|| format!("pose template has an invalid label: {pose}"))?;
+            Ok(PoseTemplate {
+                pose,
+                embedding: mean_embedding(samples.iter().map(Vec::as_slice))?,
+            })
+        })
         .collect()
 }
 
@@ -1672,6 +2007,110 @@ mod tests {
             let y = transform.b * source[0] + transform.a * source[1] + transform.ty;
             assert!((x - destination[0]).abs() < 0.001);
             assert!((y - destination[1]).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn consistent_query_finishes_after_three_samples() {
+        let samples = vec![
+            query_embedding(&[1.0, 0.00, 0.0], FaceQueryPose::Center, 0.9),
+            query_embedding(&[1.0, 0.05, 0.0], FaceQueryPose::Center, 0.8),
+            query_embedding(&[1.0, -0.04, 0.0], FaceQueryPose::Center, 0.95),
+        ];
+        let aggregate = aggregate_query_samples(&samples, false).unwrap();
+        assert_eq!(aggregate.samples_used, 3);
+        assert_eq!(aggregate.observations, 3);
+        assert_eq!(aggregate.pose, FaceQueryPose::Center);
+        assert!(aggregate.consistency > 0.99);
+        assert!(aggregate.embedding[0] > 0.99);
+    }
+
+    #[test]
+    fn inconsistent_query_waits_and_discards_the_outlier() {
+        let mut samples = vec![
+            query_embedding(&[1.0, 0.00, 0.0], FaceQueryPose::Center, 0.9),
+            query_embedding(&[1.0, 0.05, 0.0], FaceQueryPose::Center, 0.8),
+            query_embedding(&[0.0, 1.00, 0.0], FaceQueryPose::Horizontal, 0.9),
+        ];
+        assert!(aggregate_query_samples(&samples, false).is_none());
+        samples.push(query_embedding(
+            &[1.0, -0.04, 0.0],
+            FaceQueryPose::Center,
+            0.95,
+        ));
+        let aggregate = aggregate_query_samples(&samples, false).unwrap();
+        assert_eq!(aggregate.observations, 4);
+        assert_eq!(aggregate.pose, FaceQueryPose::Center);
+        assert!(aggregate.consistency > 0.99);
+        assert!(aggregate.embedding[0] > 0.99);
+    }
+
+    #[test]
+    fn pose_aware_matching_uses_only_relevant_templates() {
+        let identity = Identity {
+            id: 1,
+            name: Some("Pose Test".to_owned()),
+            centroid: normalize_embedding(&[1.0, 0.0, 0.0]).unwrap(),
+            pose_templates: vec![
+                PoseTemplate {
+                    pose: CapturePose::Center,
+                    embedding: normalize_embedding(&[0.0, 1.0, 0.0]).unwrap(),
+                },
+                PoseTemplate {
+                    pose: CapturePose::Left,
+                    embedding: normalize_embedding(&[0.0, 0.0, 1.0]).unwrap(),
+                },
+            ],
+            samples: 3,
+            fingerprint: "pose-test".to_owned(),
+        };
+        let center = normalize_embedding(&[0.0, 1.0, 0.0]).unwrap();
+        let horizontal = normalize_embedding(&[0.0, 0.0, 1.0]).unwrap();
+        assert!(identity_similarity(&identity, &center, FaceQueryPose::Center) > 0.99);
+        assert!(identity_similarity(&identity, &center, FaceQueryPose::Horizontal) < 0.01);
+        assert!(identity_similarity(&identity, &horizontal, FaceQueryPose::Horizontal) > 0.99);
+        assert!(identity_similarity(&identity, &horizontal, FaceQueryPose::Center) < 0.01);
+    }
+
+    #[test]
+    fn ordinary_matches_do_not_adapt_the_stored_centroid() {
+        let mut gallery = IdentityGallery::open_in_memory("stable-model").unwrap();
+        let original = normalize_embedding(&[1.0, 0.0, 0.0]).unwrap();
+        gallery.identify(original.clone()).unwrap();
+        gallery
+            .identify(normalize_embedding(&[0.9, 0.2, 0.0]).unwrap())
+            .unwrap();
+        assert_eq!(gallery.identities[0].samples, 1);
+        assert_eq!(gallery.identities[0].centroid, original);
+    }
+
+    #[test]
+    fn flat_aligned_frames_are_rejected_before_inference() {
+        let flat = vec![127.0; 3 * SFACE_WIDTH * SFACE_HEIGHT];
+        assert!(aligned_tensor_quality(&flat).is_none());
+        let mut textured = vec![0.0; 3 * SFACE_WIDTH * SFACE_HEIGHT];
+        let plane = SFACE_WIDTH * SFACE_HEIGHT;
+        for y in 0..SFACE_HEIGHT {
+            for x in 0..SFACE_WIDTH {
+                let value = if (x / 2 + y / 2) % 2 == 0 {
+                    24.0
+                } else {
+                    230.0
+                };
+                let offset = y * SFACE_WIDTH + x;
+                textured[offset] = value;
+                textured[plane + offset] = value;
+                textured[plane * 2 + offset] = value;
+            }
+        }
+        assert!(aligned_tensor_quality(&textured).is_some());
+    }
+
+    fn query_embedding(values: &[f32], pose: FaceQueryPose, quality: f32) -> QueryEmbeddingSample {
+        QueryEmbeddingSample {
+            embedding: normalize_embedding(values).unwrap(),
+            pose,
+            quality,
         }
     }
 

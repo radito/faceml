@@ -469,11 +469,10 @@ mod macos {
             submit_guided_capture(pixel_buffer, tracked_faces, client);
             return;
         }
+        let observed_at = Instant::now();
         let candidates = tracked_faces
             .iter()
-            .filter(|face| client.wants_track(face.track_id))
-            .filter(|face| face.geometry.confidence >= 0.5)
-            .filter(|face| face.geometry.yaw_radians.is_none_or(|yaw| yaw.abs() <= 0.7))
+            .filter(|face| client.wants_track(face.track_id, &face.geometry, observed_at))
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             return;
@@ -498,7 +497,12 @@ mod macos {
                     bytes_per_row,
                     &tracked_face.geometry,
                 ) {
-                    client.try_submit(tracked_face.track_id, tensor);
+                    client.try_submit(
+                        tracked_face.track_id,
+                        tensor,
+                        &tracked_face.geometry,
+                        observed_at,
+                    );
                 }
             }
         }

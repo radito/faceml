@@ -1,4 +1,6 @@
-# facefeature
+# FaceML
+
+<img src="img/ss.png"/>
 
 A local-first Rust face geometry detector for Apple Silicon. The first backend calls Apple's
 Vision framework directly from Rust and returns face bounds, head pose, named landmark regions,
@@ -47,8 +49,9 @@ identity pipeline when that behavior is needed:
 cargo run --release --bin facefeature-camera -- --face-id
 ```
 
-`--face-id` uses automatic read/write mode: it matches existing identities, enrolls unmatched
-faces, and updates matched centroids/sample counts.
+`--face-id` uses automatic read/write mode: it matches existing identities and enrolls unmatched
+faces after multi-frame consensus. Ordinary matches never rewrite a stored centroid, preventing a
+borderline or false match from gradually drifting a known identity.
 
 For higher-quality enrollment, use guided capture for a new named person:
 
@@ -59,8 +62,9 @@ cargo run --release --bin facefeature-camera -- --capture --name "Radit"
 The overlay guides the subject through straight, left, right, up, and down poses. It requires a
 stable hold, captures three embeddings per pose, and shows yaw, pitch, detection quality, and
 progress. All 15 pose samples are held in memory and committed together only after capture
-completes. Recognition loads five averaged pose templates per identity and uses the strongest
-cosine match alongside the main centroid. To replace/add guided templates for an existing identity:
+completes. Recognition loads five averaged pose templates per identity and selects only the
+center, horizontal, or vertical template group relevant to the live head pose, alongside the main
+centroid. To replace/add guided templates for an existing identity:
 
 ```sh
 cargo run --release --bin facefeature-camera -- --capture --person 1
@@ -82,13 +86,15 @@ In read-only mode, matched people retain their stored identity and unmatched fac
 `Unknown`; no identities are inserted and no centroids, counters, names, or timestamps are updated.
 `--read-only` and `--capture` cannot be combined. Both flags enable the face-ID pipeline.
 
-For each new tracking ID, the program aligns a 112x112 face crop and runs the bundled SFace
-MobileFaceNet model on a dedicated worker. It compares the resulting embedding with identities
-seen earlier in the same process and prints events such as:
+For each new tracking ID, the program collects three quality-scored 112x112 aligned face crops at
+90 ms intervals and runs the bundled SFace MobileFaceNet model on a dedicated worker. If those
+embeddings disagree, it collects up to five observations and selects the most mutually consistent
+three before matching. Flat, badly exposed, undersized, low-confidence, extreme-roll, and
+extreme-yaw samples are rejected before inference. It prints events such as:
 
 ```text
-face-id track=31 person=1 similarity=new fingerprint=6abf4e91d2c84410
-face-id track=36 person=1 similarity=0.812 fingerprint=6abf4e91d2c84410
+face-id track=31 person=1 similarity=new best=0.112 fingerprint=6abf4e91d2c84410 frames=3/3 consistency=0.914 quality=0.88 pose=center
+face-id track=36 person=1 similarity=0.812 fingerprint=6abf4e91d2c84410 frames=3/4 consistency=0.901 quality=0.91 pose=horizontal
 ```
 
 `track` is temporary geometry state; `person` and `fingerprint` represent the matched persistent
@@ -129,8 +135,8 @@ not provide an API that guarantees its built-in face-landmark request runs on th
 
 With `--face-id`, ONNX Runtime uses its Core ML execution provider with compute units set to `all`,
 allowing Core ML to schedule compatible SFace operations on the M1 CPU, GPU, and Neural Engine.
-Unsupported operations may fall back to the CPU. Recognition only runs for new tracking IDs, not
-on every 1280x720 camera frame.
+Unsupported operations may fall back to the CPU. Recognition runs for three to five spaced samples
+of each new tracking ID, not continuously on every 1280x720 camera frame.
 
 ## Project shape
 
