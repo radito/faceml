@@ -1,0 +1,110 @@
+[package]
+name = "facefeature"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Local, hardware-accelerated face geometry detection"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.3"
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSGraphics",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSView",
+    "NSWindow",
+    "objc2-core-foundation",
+    "objc2-quartz-core",
+] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "AVAnimation",
+    "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureOutputBase",
+    "AVCaptureSession",
+    "AVCaptureSessionPreset",
+    "AVCaptureVideoDataOutput",
+    "AVCaptureVideoPreviewLayer",
+    "AVMediaFormat",
+    "block2",
+    "dispatch2",
+    "objc2-core-foundation",
+    "objc2-core-media",
+    "objc2-core-video",
+    "objc2-quartz-core",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CFCGTypes",
+    "objc2",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CGColor",
+    "CGPath",
+    "objc2",
+] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CMSampleBuffer",
+    "objc2",
+    "objc2-core-video",
+] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CVBase",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVReturn",
+    "objc2",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSDictionary",
+    "NSNotification",
+    "NSObject",
+    "NSValue",
+    "NSString",
+    "NSURL",
+] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CALayer",
+    "CAMediaTiming",
+    "CAShapeLayer",
+    "CATextLayer",
+    "CATransaction",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+] }
+objc2-vision = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "VNDetectFaceLandmarksRequest",
+    "VNFaceLandmarks",
+    "VNObservation",
+    "VNRequest",
+    "VNRequestHandler",
+    "VNTypes",
+    "objc2-core-foundation",
+    "objc2-core-video",
+] }
+ort = { version = "=2.0.0-rc.12", features = ["download-binaries", "ndarray"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
