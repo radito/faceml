@@ -40,6 +40,21 @@ Face numbers are persistent tracking IDs rather than per-frame detection indexes
 global face-to-track assignment, motion prediction, geometry smoothing, and a short missing-face
 grace period so IDs survive detector reordering and brief occlusion.
 
+Add a dense translucent wireframe that triangulates the available face landmarks and follows the
+smoothed cheek, jaw, nose, eye, mouth, and estimated forehead geometry:
+
+```sh
+cargo run --release --bin facefeature-camera -- --face-mask polygon
+```
+
+Several roll-aware synthetic forehead rows close the region that Apple Vision does not directly
+landmark, while the eyes and inner mouth remain open. Shared edge midpoints are interpolated along
+every oversized edge before repeated Delaunay triangulation, producing a consistent face-relative
+triangle size across the forehead, cheeks, nose, and mouth while retaining the original Vision
+landmark outlines. The polygon mask is rendered with a lightweight Core Animation shape layer. It
+does not require face recognition and can be combined with `--face-id`, `--read-only`, or
+`--capture`.
+
 ### Optional face identity
 
 Geometry tracking cannot recognize somebody after their track expires. Enable the separate local

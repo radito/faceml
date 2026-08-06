@@ -1,7 +1,7 @@
 #[cfg(target_os = "macos")]
 mod macos {
     use std::cell::OnceCell;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::env;
     use std::path::PathBuf;
     use std::process::Command;
@@ -56,6 +56,7 @@ mod macos {
     #[derive(Debug)]
     struct FrameDelegateIvars {
         preview_layer: usize,
+        face_mask_layer: Option<usize>,
         overlay_layer: usize,
         last_processed: Mutex<Option<Instant>>,
         last_label_refresh: Mutex<Option<Instant>>,
@@ -92,11 +93,13 @@ mod macos {
     impl FrameDelegate {
         fn new(
             preview_layer: &Retained<AVCaptureVideoPreviewLayer>,
+            face_mask_layer: Option<&Retained<CAShapeLayer>>,
             overlay_layer: &Retained<CAShapeLayer>,
             face_id: Option<Arc<FaceIdClient>>,
         ) -> Retained<Self> {
             let ivars = FrameDelegateIvars {
                 preview_layer: Retained::as_ptr(preview_layer) as usize,
+                face_mask_layer: face_mask_layer.map(|layer| Retained::as_ptr(layer) as usize),
                 overlay_layer: Retained::as_ptr(overlay_layer) as usize,
                 last_processed: Mutex::new(None),
                 last_label_refresh: Mutex::new(None),
@@ -187,12 +190,16 @@ mod macos {
             };
 
             let preview_layer = self.ivars().preview_layer;
+            let face_mask_layer = self.ivars().face_mask_layer;
             let overlay_layer = self.ivars().overlay_layer;
             DispatchQueue::main().exec_async(move || {
                 let preview = unsafe { &*(preview_layer as *const AVCaptureVideoPreviewLayer) };
+                let face_mask =
+                    face_mask_layer.map(|layer| unsafe { &*(layer as *const CAShapeLayer) });
                 let overlay = unsafe { &*(overlay_layer as *const CAShapeLayer) };
                 update_overlay(
                     preview,
+                    face_mask,
                     overlay,
                     &tracked_faces,
                     &face_id_matches,
@@ -209,10 +216,12 @@ mod macos {
         window: OnceCell<Retained<NSWindow>>,
         session: OnceCell<Retained<AVCaptureSession>>,
         preview_layer: OnceCell<Retained<AVCaptureVideoPreviewLayer>>,
+        face_mask_layer: OnceCell<Retained<CAShapeLayer>>,
         overlay_layer: OnceCell<Retained<CAShapeLayer>>,
         frame_delegate: OnceCell<Retained<FrameDelegate>>,
         video_output: OnceCell<Retained<AVCaptureVideoDataOutput>>,
         face_id: Option<Arc<FaceIdClient>>,
+        face_mask: FaceMaskMode,
     }
 
     define_class!(
@@ -256,9 +265,14 @@ mod macos {
     );
 
     impl AppDelegate {
-        fn new(mtm: MainThreadMarker, face_id: Option<Arc<FaceIdClient>>) -> Retained<Self> {
+        fn new(
+            mtm: MainThreadMarker,
+            face_id: Option<Arc<FaceIdClient>>,
+            face_mask: FaceMaskMode,
+        ) -> Retained<Self> {
             let this = Self::alloc(mtm).set_ivars(AppDelegateIvars {
                 face_id,
+                face_mask,
                 ..AppDelegateIvars::default()
             });
             unsafe { msg_send![super(this), init] }
@@ -340,13 +354,36 @@ mod macos {
                 overlay.setLineJoin(kCALineJoinRound);
             }
 
+            let face_mask = (self.ivars().face_mask == FaceMaskMode::Polygon).then(|| {
+                let layer = CAShapeLayer::layer();
+                let stroke = CGColor::new_generic_rgb(0.15, 1.0, 0.42, 0.72);
+                layer.setFillColor(None);
+                layer.setStrokeColor(Some(&stroke));
+                layer.setLineWidth(0.85);
+                unsafe {
+                    layer.setLineCap(kCALineCapRound);
+                    layer.setLineJoin(kCALineJoinRound);
+                }
+                layer
+            });
+
             preview.setFrame(content_view.bounds());
+            if let Some(face_mask) = &face_mask {
+                face_mask.setFrame(content_view.bounds());
+            }
             overlay.setFrame(content_view.bounds());
             root_layer.addSublayer(&preview);
+            if let Some(face_mask) = &face_mask {
+                root_layer.addSublayer(face_mask);
+            }
             root_layer.addSublayer(&overlay);
 
-            let frame_delegate =
-                FrameDelegate::new(&preview, &overlay, self.ivars().face_id.clone());
+            let frame_delegate = FrameDelegate::new(
+                &preview,
+                face_mask.as_ref(),
+                &overlay,
+                self.ivars().face_id.clone(),
+            );
             let frame_queue =
                 DispatchQueue::new("dev.facefeature.camera.frames", DispatchQueueAttr::SERIAL);
             unsafe {
@@ -359,6 +396,9 @@ mod macos {
             self.ivars().window.set(window.clone()).unwrap();
             self.ivars().session.set(session.clone()).unwrap();
             self.ivars().preview_layer.set(preview).unwrap();
+            if let Some(face_mask) = face_mask {
+                self.ivars().face_mask_layer.set(face_mask).unwrap();
+            }
             self.ivars().overlay_layer.set(overlay).unwrap();
             self.ivars().frame_delegate.set(frame_delegate).unwrap();
             self.ivars().video_output.set(output).unwrap();
@@ -390,6 +430,9 @@ mod macos {
             CATransaction::setDisableActions(true);
             if let Some(preview) = self.ivars().preview_layer.get() {
                 preview.setFrame(bounds);
+            }
+            if let Some(face_mask) = self.ivars().face_mask_layer.get() {
+                face_mask.setFrame(bounds);
             }
             if let Some(overlay) = self.ivars().overlay_layer.get() {
                 overlay.setFrame(bounds);
@@ -559,6 +602,7 @@ mod macos {
 
     fn update_overlay(
         preview: &AVCaptureVideoPreviewLayer,
+        face_mask: Option<&CAShapeLayer>,
         overlay: &CAShapeLayer,
         tracked_faces: &[TrackedFace],
         face_id_matches: &HashMap<u64, FaceIdentityMatch>,
@@ -566,6 +610,13 @@ mod macos {
         refresh_labels: bool,
         inference_milliseconds: f64,
     ) {
+        let face_mask_path = face_mask.map(|_| {
+            let path = CGMutablePath::new();
+            for tracked_face in tracked_faces {
+                add_polygon_face_mask(&path, preview, &tracked_face.geometry);
+            }
+            path
+        });
         let path = CGMutablePath::new();
         for tracked_face in tracked_faces {
             let face = &tracked_face.geometry;
@@ -587,6 +638,9 @@ mod macos {
 
         CATransaction::begin();
         CATransaction::setDisableActions(true);
+        if let (Some(face_mask), Some(face_mask_path)) = (face_mask, face_mask_path) {
+            face_mask.setPath(Some(&face_mask_path));
+        }
         overlay.setPath(Some(&path));
         if refresh_labels {
             replace_face_labels(
@@ -857,6 +911,429 @@ mod macos {
         CGMutablePath::close_subpath(Some(path));
     }
 
+    fn add_polygon_face_mask(
+        path: &CGMutablePath,
+        preview: &AVCaptureVideoPreviewLayer,
+        face: &facefeature::FaceGeometry,
+    ) {
+        let Some(mesh) = polygon_face_mesh(face) else {
+            return;
+        };
+        let mut edges = HashSet::new();
+        for triangle in mesh.triangles {
+            for (left, right) in [
+                (triangle[0], triangle[1]),
+                (triangle[1], triangle[2]),
+                (triangle[2], triangle[0]),
+            ] {
+                let edge = if left < right {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                if !edges.insert(edge) {
+                    continue;
+                }
+                let first = layer_point(preview, mesh.vertices[left]);
+                let second = layer_point(preview, mesh.vertices[right]);
+                unsafe {
+                    CGMutablePath::move_to_point(Some(path), std::ptr::null(), first.x, first.y);
+                    CGMutablePath::add_line_to_point(
+                        Some(path),
+                        std::ptr::null(),
+                        second.x,
+                        second.y,
+                    );
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct PolygonFaceMesh {
+        vertices: Vec<Point>,
+        triangles: Vec<[usize; 3]>,
+    }
+
+    fn polygon_face_mesh(face: &facefeature::FaceGeometry) -> Option<PolygonFaceMesh> {
+        let bounds = face.bounding_box;
+        if bounds.width <= f64::EPSILON || bounds.height <= f64::EPSILON {
+            return None;
+        }
+        let mut vertices = face
+            .landmarks
+            .iter()
+            .find(|region| region.kind == LandmarkKind::AllPoints)
+            .map(|region| region.points.clone())
+            .unwrap_or_else(|| {
+                face.landmarks
+                    .iter()
+                    .filter(|region| region.kind != LandmarkKind::AllPoints)
+                    .flat_map(|region| region.points.iter().copied())
+                    .collect()
+            });
+        deduplicate_mesh_vertices(&mut vertices, bounds.width, bounds.height);
+        add_forehead_mesh_vertices(face, &mut vertices);
+        constrain_mesh_vertices(&mut vertices, bounds);
+        deduplicate_mesh_vertices(&mut vertices, bounds.width, bounds.height);
+        interpolate_uniform_mesh(&mut vertices, bounds);
+        constrain_mesh_vertices(&mut vertices, bounds);
+        deduplicate_mesh_vertices(&mut vertices, bounds.width, bounds.height);
+        if vertices.len() < 3 {
+            return None;
+        }
+
+        let local_vertices = vertices
+            .iter()
+            .map(|point| Point {
+                x: (point.x - bounds.x) / bounds.width,
+                y: (point.y - bounds.y) / bounds.height,
+            })
+            .collect::<Vec<_>>();
+        let triangles = delaunay_triangles(&local_vertices)
+            .into_iter()
+            .filter(|triangle| !triangle_is_feature_hole(face, &vertices, *triangle))
+            .collect::<Vec<_>>();
+        (!triangles.is_empty()).then_some(PolygonFaceMesh {
+            vertices,
+            triangles,
+        })
+    }
+
+    fn deduplicate_mesh_vertices(vertices: &mut Vec<Point>, width: f64, height: f64) {
+        let mut unique = Vec::<Point>::with_capacity(vertices.len());
+        for point in vertices.drain(..) {
+            let duplicate = unique.iter().any(|candidate| {
+                let dx = (candidate.x - point.x) / width;
+                let dy = (candidate.y - point.y) / height;
+                dx * dx + dy * dy < 0.000_025
+            });
+            if !duplicate {
+                unique.push(point);
+            }
+        }
+        *vertices = unique;
+    }
+
+    fn add_forehead_mesh_vertices(face: &facefeature::FaceGeometry, vertices: &mut Vec<Point>) {
+        let bounds = face.bounding_box;
+        let left_eye = landmark_center(face, LandmarkKind::LeftEye);
+        let right_eye = landmark_center(face, LandmarkKind::RightEye);
+        let (origin, horizontal, vertical) = match left_eye.zip(right_eye) {
+            Some((left, right)) => {
+                let mut horizontal = Point {
+                    x: right.x - left.x,
+                    y: right.y - left.y,
+                };
+                let length = horizontal.x.hypot(horizontal.y);
+                if length <= f64::EPSILON {
+                    return;
+                }
+                horizontal.x /= length;
+                horizontal.y /= length;
+                let mut vertical = Point {
+                    x: -horizontal.y,
+                    y: horizontal.x,
+                };
+                if vertical.y < 0.0 {
+                    vertical.x = -vertical.x;
+                    vertical.y = -vertical.y;
+                }
+                (
+                    Point {
+                        x: (left.x + right.x) * 0.5,
+                        y: (left.y + right.y) * 0.5,
+                    },
+                    horizontal,
+                    vertical,
+                )
+            }
+            None => (
+                Point {
+                    x: bounds.x + bounds.width * 0.5,
+                    y: bounds.y + bounds.height * 0.58,
+                },
+                Point { x: 1.0, y: 0.0 },
+                Point { x: 0.0, y: 1.0 },
+            ),
+        };
+
+        let Some(upward_space) = ray_distance_to_bounds(origin, vertical, bounds) else {
+            return;
+        };
+        let horizontal_projection = |point: Point| {
+            (point.x - origin.x) * horizontal.x + (point.y - origin.y) * horizontal.y
+        };
+        let contour = face
+            .landmarks
+            .iter()
+            .find(|region| region.kind == LandmarkKind::FaceContour)
+            .map(|region| region.points.as_slice())
+            .unwrap_or_default();
+        let (left_extent, right_extent) = contour.iter().copied().map(horizontal_projection).fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(left, right), value| (left.min(value), right.max(value)),
+        );
+        let (left_extent, right_extent) = if left_extent.is_finite()
+            && right_extent.is_finite()
+            && right_extent - left_extent > f64::EPSILON
+        {
+            (left_extent, right_extent)
+        } else {
+            (-bounds.width * 0.45, bounds.width * 0.45)
+        };
+        let forehead_center = (left_extent + right_extent) * 0.5;
+        const FOREHEAD_ROWS: [(f64, f64, usize); 5] = [
+            (0.06, 0.98, 11),
+            (0.27, 0.92, 11),
+            (0.48, 0.83, 10),
+            (0.69, 0.71, 9),
+            (0.90, 0.57, 7),
+        ];
+        for (height_fraction, width_fraction, columns) in FOREHEAD_ROWS {
+            let row_left = forehead_center + (left_extent - forehead_center) * width_fraction;
+            let row_right = forehead_center + (right_extent - forehead_center) * width_fraction;
+            for column in 0..columns {
+                let horizontal_offset = if columns == 1 {
+                    forehead_center
+                } else {
+                    row_left + (row_right - row_left) * column as f64 / (columns - 1) as f64
+                };
+                vertices.push(Point {
+                    x: origin.x
+                        + horizontal.x * horizontal_offset
+                        + vertical.x * upward_space * height_fraction,
+                    y: origin.y
+                        + horizontal.y * horizontal_offset
+                        + vertical.y * upward_space * height_fraction,
+                });
+            }
+        }
+    }
+
+    fn ray_distance_to_bounds(
+        origin: Point,
+        direction: Point,
+        bounds: facefeature::BoundingBox,
+    ) -> Option<f64> {
+        let mut distances = Vec::with_capacity(2);
+        if direction.x > f64::EPSILON {
+            distances.push((bounds.x + bounds.width - origin.x) / direction.x);
+        } else if direction.x < -f64::EPSILON {
+            distances.push((bounds.x - origin.x) / direction.x);
+        }
+        if direction.y > f64::EPSILON {
+            distances.push((bounds.y + bounds.height - origin.y) / direction.y);
+        } else if direction.y < -f64::EPSILON {
+            distances.push((bounds.y - origin.y) / direction.y);
+        }
+        distances
+            .into_iter()
+            .filter(|distance| distance.is_finite() && *distance > 0.0)
+            .reduce(f64::min)
+    }
+
+    fn constrain_mesh_vertices(vertices: &mut [Point], bounds: facefeature::BoundingBox) {
+        let inset_x = bounds.width * 0.008;
+        let inset_y = bounds.height * 0.008;
+        for point in vertices {
+            point.x = point
+                .x
+                .clamp(bounds.x + inset_x, bounds.x + bounds.width - inset_x);
+            point.y = point
+                .y
+                .clamp(bounds.y + inset_y, bounds.y + bounds.height - inset_y);
+        }
+    }
+
+    fn interpolate_uniform_mesh(vertices: &mut Vec<Point>, bounds: facefeature::BoundingBox) {
+        const TARGET_EDGE_LENGTH: f64 = 0.075;
+        const MAX_REFINEMENT_PASSES: usize = 6;
+        const MAX_MESH_VERTICES: usize = 600;
+        if vertices.len() < 3 || bounds.width <= f64::EPSILON || bounds.height <= f64::EPSILON {
+            return;
+        }
+        for _ in 0..MAX_REFINEMENT_PASSES {
+            let local_vertices = vertices
+                .iter()
+                .map(|point| Point {
+                    x: (point.x - bounds.x) / bounds.width,
+                    y: (point.y - bounds.y) / bounds.height,
+                })
+                .collect::<Vec<_>>();
+            let triangles = delaunay_triangles(&local_vertices);
+            let mut long_edges = BTreeSet::new();
+            for triangle in triangles {
+                for (left, right) in [
+                    (triangle[0], triangle[1]),
+                    (triangle[1], triangle[2]),
+                    (triangle[2], triangle[0]),
+                ] {
+                    if local_vertices[left].distance(local_vertices[right]) <= TARGET_EDGE_LENGTH {
+                        continue;
+                    }
+                    long_edges.insert(if left < right {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    });
+                }
+            }
+            if long_edges.is_empty() || vertices.len() >= MAX_MESH_VERTICES {
+                break;
+            }
+            let remaining = MAX_MESH_VERTICES - vertices.len();
+            let interpolated = long_edges
+                .into_iter()
+                .take(remaining)
+                .map(|(left, right)| Point {
+                    x: (vertices[left].x + vertices[right].x) * 0.5,
+                    y: (vertices[left].y + vertices[right].y) * 0.5,
+                })
+                .collect::<Vec<_>>();
+            vertices.extend(interpolated);
+            constrain_mesh_vertices(vertices, bounds);
+            deduplicate_mesh_vertices(vertices, bounds.width, bounds.height);
+        }
+    }
+
+    fn delaunay_triangles(points: &[Point]) -> Vec<[usize; 3]> {
+        if points.len() < 3 {
+            return Vec::new();
+        }
+        let original_count = points.len();
+        let mut work = points.to_vec();
+        work.extend([
+            Point { x: -10.0, y: -10.0 },
+            Point { x: 10.0, y: -10.0 },
+            Point { x: 0.0, y: 10.0 },
+        ]);
+        let mut triangles = vec![[original_count, original_count + 1, original_count + 2]];
+
+        for point_index in 0..original_count {
+            let mut edge_counts = BTreeMap::<(usize, usize), usize>::new();
+            let mut retained = Vec::with_capacity(triangles.len());
+            for triangle in triangles {
+                if circumcircle_contains(&work, triangle, work[point_index]) {
+                    for (left, right) in [
+                        (triangle[0], triangle[1]),
+                        (triangle[1], triangle[2]),
+                        (triangle[2], triangle[0]),
+                    ] {
+                        let edge = if left < right {
+                            (left, right)
+                        } else {
+                            (right, left)
+                        };
+                        *edge_counts.entry(edge).or_default() += 1;
+                    }
+                } else {
+                    retained.push(triangle);
+                }
+            }
+            triangles = retained;
+            triangles.extend(
+                edge_counts
+                    .into_iter()
+                    .filter(|(_, count)| *count == 1)
+                    .filter_map(|((left, right), _)| {
+                        (triangle_area(work[left], work[right], work[point_index]).abs() > 1e-10)
+                            .then_some([left, right, point_index])
+                    }),
+            );
+        }
+
+        triangles
+            .into_iter()
+            .filter(|triangle| triangle.iter().all(|index| *index < original_count))
+            .collect()
+    }
+
+    fn circumcircle_contains(points: &[Point], triangle: [usize; 3], point: Point) -> bool {
+        let [a, b, c] = triangle.map(|index| points[index]);
+        let denominator = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+        if denominator.abs() <= 1e-12 {
+            return false;
+        }
+        let a_squared = a.x * a.x + a.y * a.y;
+        let b_squared = b.x * b.x + b.y * b.y;
+        let c_squared = c.x * c.x + c.y * c.y;
+        let center = Point {
+            x: (a_squared * (b.y - c.y) + b_squared * (c.y - a.y) + c_squared * (a.y - b.y))
+                / denominator,
+            y: (a_squared * (c.x - b.x) + b_squared * (a.x - c.x) + c_squared * (b.x - a.x))
+                / denominator,
+        };
+        let radius_squared = (center.x - a.x).powi(2) + (center.y - a.y).powi(2);
+        let distance_squared = (center.x - point.x).powi(2) + (center.y - point.y).powi(2);
+        distance_squared <= radius_squared + 1e-10
+    }
+
+    fn triangle_area(a: Point, b: Point, c: Point) -> f64 {
+        (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+    }
+
+    fn triangle_is_feature_hole(
+        face: &facefeature::FaceGeometry,
+        vertices: &[Point],
+        triangle: [usize; 3],
+    ) -> bool {
+        let center = triangle.into_iter().map(|index| vertices[index]).fold(
+            Point { x: 0.0, y: 0.0 },
+            |sum, point| Point {
+                x: sum.x + point.x / 3.0,
+                y: sum.y + point.y / 3.0,
+            },
+        );
+        [
+            LandmarkKind::LeftEye,
+            LandmarkKind::RightEye,
+            LandmarkKind::InnerLips,
+        ]
+        .into_iter()
+        .filter_map(|kind| face.landmarks.iter().find(|region| region.kind == kind))
+        .any(|region| point_in_polygon(center, &region.points))
+    }
+
+    fn point_in_polygon(point: Point, polygon: &[Point]) -> bool {
+        if polygon.len() < 3 {
+            return false;
+        }
+        let mut inside = false;
+        let mut previous = polygon.len() - 1;
+        for current in 0..polygon.len() {
+            let a = polygon[current];
+            let b = polygon[previous];
+            if (a.y > point.y) != (b.y > point.y)
+                && point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x
+            {
+                inside = !inside;
+            }
+            previous = current;
+        }
+        inside
+    }
+
+    fn landmark_center(face: &facefeature::FaceGeometry, kind: LandmarkKind) -> Option<Point> {
+        let points = &face
+            .landmarks
+            .iter()
+            .find(|region| region.kind == kind)?
+            .points;
+        (!points.is_empty()).then(|| {
+            let sum = points
+                .iter()
+                .fold(Point { x: 0.0, y: 0.0 }, |sum, point| Point {
+                    x: sum.x + point.x,
+                    y: sum.y + point.y,
+                });
+            Point {
+                x: sum.x / points.len() as f64,
+                y: sum.y / points.len() as f64,
+            }
+        })
+    }
+
     fn add_polyline(
         path: &CGMutablePath,
         preview: &AVCaptureVideoPreviewLayer,
@@ -906,6 +1383,13 @@ mod macos {
         CGPoint::new(point.x, point.y)
     }
 
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    enum FaceMaskMode {
+        #[default]
+        None,
+        Polygon,
+    }
+
     #[derive(Debug, Default, PartialEq)]
     struct CameraOptions {
         face_id_model: Option<PathBuf>,
@@ -914,6 +1398,7 @@ mod macos {
         capture_requested: bool,
         capture_target: Option<FaceCaptureTarget>,
         benchmark_iterations: Option<usize>,
+        face_mask: FaceMaskMode,
         show_help: bool,
     }
 
@@ -982,6 +1467,16 @@ mod macos {
                         PathBuf::from("models/face_recognition_sface_2021dec.onnx")
                     });
                 }
+                "--face-mask" => {
+                    let value = arguments
+                        .next()
+                        .ok_or("--face-mask requires polygon or none")?;
+                    options.face_mask = match value.as_str() {
+                        "polygon" => FaceMaskMode::Polygon,
+                        "none" => FaceMaskMode::None,
+                        _ => return Err("--face-mask requires polygon or none".to_owned()),
+                    };
+                }
                 "--name" => {
                     let name = arguments.next().ok_or("--name requires a value")?;
                     if name.trim().is_empty() {
@@ -1031,7 +1526,7 @@ mod macos {
 
     fn print_help() {
         println!(
-            "facefeature-camera\n\nUSAGE:\n    facefeature-camera --face-id [OPTIONS]\n    facefeature-camera --read-only [OPTIONS]\n    facefeature-camera --capture (--name NAME | --person ID) [OPTIONS]\n    facefeature-camera --benchmark [OPTIONS]\n\nOPTIONS:\n    --face-id                 Automatic matching and enrollment\n    --read-only               Match from SQLite without inserting or updating rows\n    --capture                 Guided center/left/right/up/down enrollment\n    --name NAME               Create a new named identity during guided capture\n    --person ID               Replace/add guided samples for an existing identity\n    --benchmark               Benchmark headless SFace/Core ML inference\n    --benchmark-iterations N  Timed iterations (default: 100)\n    --face-id-model PATH      Use a custom SFace ONNX model\n    --face-id-db PATH         Use a custom SQLite identity gallery path\n    -h, --help                Print this help"
+            "facefeature-camera\n\nUSAGE:\n    facefeature-camera [OPTIONS]\n    facefeature-camera --face-id [OPTIONS]\n    facefeature-camera --read-only [OPTIONS]\n    facefeature-camera --capture (--name NAME | --person ID) [OPTIONS]\n    facefeature-camera --benchmark [OPTIONS]\n\nOPTIONS:\n    --face-id                 Automatic matching and enrollment\n    --read-only               Match from SQLite without inserting or updating rows\n    --capture                 Guided center/left/right/up/down enrollment\n    --name NAME               Create a new named identity during guided capture\n    --person ID               Replace/add guided samples for an existing identity\n    --face-mask MODE          Face overlay: polygon or none (default)\n    --benchmark               Benchmark headless SFace/Core ML inference\n    --benchmark-iterations N  Timed iterations (default: 100)\n    --face-id-model PATH      Use a custom SFace ONNX model\n    --face-id-db PATH         Use a custom SQLite identity gallery path\n    -h, --help                Print this help"
         );
     }
 
@@ -1155,7 +1650,7 @@ mod macos {
         ensure_camera_access()?;
         let mtm = MainThreadMarker::new().ok_or("camera UI must start on the main thread")?;
         let app = NSApplication::sharedApplication(mtm);
-        let delegate = AppDelegate::new(mtm, face_id);
+        let delegate = AppDelegate::new(mtm, face_id, options.face_mask);
         app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         app.run();
         Ok(())
@@ -1304,6 +1799,131 @@ mod macos {
             ])
             .unwrap_err();
             assert!(error.contains("cannot be used together"));
+        }
+
+        #[test]
+        fn polygon_face_mask_is_an_independent_camera_option() {
+            let options = parse_options(["--face-mask".to_owned(), "polygon".to_owned()]).unwrap();
+            assert_eq!(options.face_mask, FaceMaskMode::Polygon);
+            assert!(options.face_id_model.is_none());
+            assert!(options.face_id_database.is_none());
+        }
+
+        #[test]
+        fn face_mask_rejects_unknown_modes() {
+            let error = parse_options(["--face-mask".to_owned(), "metal".to_owned()]).unwrap_err();
+            assert_eq!(error, "--face-mask requires polygon or none");
+        }
+
+        #[test]
+        fn polygon_mesh_densifies_the_contour_with_a_forehead() {
+            let bounds = facefeature::BoundingBox {
+                x: 0.2,
+                y: 0.1,
+                width: 0.5,
+                height: 0.7,
+            };
+            let landmarks = vec![
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::FaceContour,
+                    points: vec![
+                        Point { x: 0.23, y: 0.55 },
+                        Point { x: 0.27, y: 0.24 },
+                        Point { x: 0.45, y: 0.13 },
+                        Point { x: 0.63, y: 0.24 },
+                        Point { x: 0.67, y: 0.55 },
+                    ],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::Nose,
+                    points: vec![Point { x: 0.45, y: 0.43 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::LeftEye,
+                    points: vec![Point { x: 0.35, y: 0.74 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::RightEye,
+                    points: vec![Point { x: 0.55, y: 0.74 }],
+                },
+            ];
+            let face = facefeature::FaceGeometry {
+                confidence: 0.99,
+                landmark_confidence: 0.99,
+                bounding_box: bounds,
+                roll_radians: None,
+                yaw_radians: None,
+                pitch_radians: None,
+                measurements: facefeature::FaceGeometry::calculate_measurements(bounds, &landmarks),
+                landmarks,
+            };
+
+            let mesh = polygon_face_mesh(&face).unwrap();
+            assert!(mesh.vertices.len() > landmarks_point_count(&face) + 48);
+            assert!(mesh.triangles.len() > 20);
+            assert!(
+                mesh.vertices
+                    .iter()
+                    .any(|point| point.y > bounds.y + bounds.height * 0.9)
+            );
+            assert!(
+                mesh.triangles
+                    .iter()
+                    .all(|triangle| triangle.iter().all(|index| *index < mesh.vertices.len()))
+            );
+            assert!(mesh.vertices.iter().all(|point| {
+                point.x >= bounds.x
+                    && point.x <= bounds.x + bounds.width
+                    && point.y >= bounds.y
+                    && point.y <= bounds.y + bounds.height
+            }));
+            assert!(
+                mesh.vertices
+                    .iter()
+                    .all(|point| (0.23..=0.67).contains(&point.x))
+            );
+            let longest_edge = mesh
+                .triangles
+                .iter()
+                .flat_map(|triangle| {
+                    [
+                        (triangle[0], triangle[1]),
+                        (triangle[1], triangle[2]),
+                        (triangle[2], triangle[0]),
+                    ]
+                })
+                .map(|(left, right)| {
+                    let left = Point {
+                        x: (mesh.vertices[left].x - bounds.x) / bounds.width,
+                        y: (mesh.vertices[left].y - bounds.y) / bounds.height,
+                    };
+                    let right = Point {
+                        x: (mesh.vertices[right].x - bounds.x) / bounds.width,
+                        y: (mesh.vertices[right].y - bounds.y) / bounds.height,
+                    };
+                    left.distance(right)
+                })
+                .fold(0.0_f64, f64::max);
+            assert!(longest_edge <= 0.085, "longest edge was {longest_edge}");
+            assert!(mesh.vertices.len() <= 600);
+        }
+
+        #[test]
+        fn delaunay_mesh_triangulates_a_square() {
+            let triangles = delaunay_triangles(&[
+                Point { x: 0.0, y: 0.0 },
+                Point { x: 1.0, y: 0.0 },
+                Point { x: 1.0, y: 1.0 },
+                Point { x: 0.0, y: 1.0 },
+            ]);
+            assert_eq!(triangles.len(), 2);
+        }
+
+        fn landmarks_point_count(face: &facefeature::FaceGeometry) -> usize {
+            face.landmarks
+                .iter()
+                .map(|region| region.points.len())
+                .sum()
         }
 
         #[test]
