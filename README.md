@@ -63,12 +63,14 @@ Render the same geometry as a pseudo-3D wireframe with smoothly graded surface l
 cargo run --release --bin facefeature-camera -- --face-mask depth --mask-only
 ```
 
-Depth mode fits an ellipsoid to the face box, pushes the detected nose and lips forward, recesses
-the eye regions, and biases the near cheek using Vision's yaw. Triangle normals illuminate eight
-subtle intensity layers, averaging the two adjacent surfaces at shared edges to avoid the harsh
-three-band heatmap effect. Raw Vision landmark outlines are also drawn more softly in this mode.
-This is an inferred artistic Z value from a monocular camera, not measured physical depth, and it
-is used only for rendering.
+Depth mode maps the landmarks into roll-normalized canonical face coordinates and fits a smooth
+rational dome that remains curved even when profile-warped points extend beyond the nominal face
+ellipse. The detected nose and lips move forward and the eye regions recess. Yaw, pitch, and roll
+rotate the resulting 3D surface normals once for lighting and visibility while Vision's projected
+2D points remain the drawing anchors, preventing double-yaw drift. Eight subtle intensity layers
+average the two adjacent surfaces at shared edges, and raw Vision landmark outlines are drawn more
+softly. This is an inferred artistic Z value from a monocular camera, not measured physical depth,
+and it is used only for rendering.
 
 Several roll-aware synthetic forehead rows close the region that Apple Vision does not directly
 landmark. Their width uses the contour's temple endpoints rather than roll-sensitive jaw extrema,

@@ -1047,18 +1047,7 @@ mod macos {
         depths: &[f64],
         triangle: [usize; 3],
     ) -> f64 {
-        let bounds = face.bounding_box;
-        if bounds.width <= f64::EPSILON || bounds.height <= f64::EPSILON {
-            return 0.35;
-        }
-        let vertex = |index: usize| {
-            let point = mesh.vertices[index];
-            [
-                (point.x - bounds.x) / bounds.width,
-                (point.y - bounds.y) / bounds.height,
-                depths[index] * 0.42,
-            ]
-        };
+        let vertex = |index: usize| canonical_face_position(face, mesh.vertices[index]);
         let first = vertex(triangle[0]);
         let second = vertex(triangle[1]);
         let third = vertex(triangle[2]);
@@ -1085,11 +1074,42 @@ mod macos {
             return 0.35;
         }
         normal = [normal[0] / length, normal[1] / length, normal[2] / length];
+        normal = rotate_surface_normal(face, normal);
         let light = [-0.24, 0.18, 0.954];
         let diffuse =
             (normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2]).clamp(0.0, 1.0);
+        let visibility = ((normal[2] + 0.12) / 0.52).clamp(0.0, 1.0);
         let average_depth = (depths[triangle[0]] + depths[triangle[1]] + depths[triangle[2]]) / 3.0;
-        (0.28 + diffuse * 0.57 + average_depth * 0.15).clamp(0.0, 1.0)
+        (0.18 + visibility * (0.12 + diffuse * 0.55) + average_depth * 0.10).clamp(0.0, 1.0)
+    }
+
+    fn rotate_surface_normal(face: &facefeature::FaceGeometry, normal: [f64; 3]) -> [f64; 3] {
+        let yaw = face.yaw_radians.unwrap_or(0.0);
+        let pitch = face.pitch_radians.unwrap_or_else(|| {
+            landmark_pitch_degrees(face)
+                .map(f64::to_radians)
+                .unwrap_or(0.0)
+        });
+        let roll = face.roll_radians.unwrap_or(0.0);
+
+        let (yaw_sin, yaw_cos) = yaw.sin_cos();
+        let yawed = [
+            normal[0] * yaw_cos + normal[2] * yaw_sin,
+            normal[1],
+            -normal[0] * yaw_sin + normal[2] * yaw_cos,
+        ];
+        let (pitch_sin, pitch_cos) = pitch.sin_cos();
+        let pitched = [
+            yawed[0],
+            yawed[1] * pitch_cos - yawed[2] * pitch_sin,
+            yawed[1] * pitch_sin + yawed[2] * pitch_cos,
+        ];
+        let (roll_sin, roll_cos) = roll.sin_cos();
+        [
+            pitched[0] * roll_cos - pitched[1] * roll_sin,
+            pitched[0] * roll_sin + pitched[1] * roll_cos,
+            pitched[2],
+        ]
     }
 
     fn pseudo_face_depth(face: &facefeature::FaceGeometry, point: Point) -> f64 {
@@ -1097,25 +1117,20 @@ mod macos {
         if bounds.width <= f64::EPSILON || bounds.height <= f64::EPSILON {
             return 0.0;
         }
-        let center = Point {
-            x: bounds.x + bounds.width * 0.5,
-            y: bounds.y + bounds.height * 0.5,
-        };
-        let normalized_x = (point.x - center.x) / (bounds.width * 0.54);
-        let normalized_y = (point.y - center.y) / (bounds.height * 0.58);
-        let ellipsoid = (1.0 - normalized_x * normalized_x - normalized_y * normalized_y)
-            .max(0.0)
-            .sqrt();
-        let mut depth = ellipsoid * 0.78;
+        let (normalized_x, normalized_y) = canonical_face_coordinates(face, point);
+        let radial_squared = normalized_x * normalized_x + normalized_y * normalized_y;
+        // A rational dome stays smooth beyond the nominal face ellipse. Unlike a hemisphere's
+        // sqrt(max(0, ...)), it does not collapse profile-warped vertices onto a flat Z=0 sheet.
+        let mut depth = 0.78 / (1.0 + radial_squared * 1.15);
 
         if let Some(nose) = landmark_center(face, LandmarkKind::Nose)
             .or_else(|| landmark_center(face, LandmarkKind::NoseCrest))
         {
             depth +=
-                0.34 * feature_depth_weight(point, nose, bounds.width * 0.15, bounds.height * 0.20);
+                0.30 * feature_depth_weight(point, nose, bounds.width * 0.15, bounds.height * 0.20);
         }
         if let Some(mouth) = landmark_center(face, LandmarkKind::OuterLips) {
-            depth += 0.10
+            depth += 0.07
                 * feature_depth_weight(point, mouth, bounds.width * 0.23, bounds.height * 0.12);
         }
         for eye in [
@@ -1126,15 +1141,32 @@ mod macos {
         .flatten()
         {
             depth -=
-                0.09 * feature_depth_weight(point, eye, bounds.width * 0.16, bounds.height * 0.10);
+                0.06 * feature_depth_weight(point, eye, bounds.width * 0.16, bounds.height * 0.10);
         }
+        depth.clamp(0.08, 1.0)
+    }
 
-        // A turned face presents one cheek closer to the viewer. This small pose-dependent bias
-        // makes the depth bands travel across the wireframe instead of remaining frontally flat.
-        if let Some(yaw) = face.yaw_radians {
-            depth -= normalized_x * yaw.sin() * 0.16;
-        }
-        depth.clamp(0.0, 1.0)
+    fn canonical_face_position(face: &facefeature::FaceGeometry, point: Point) -> [f64; 3] {
+        let (x, y) = canonical_face_coordinates(face, point);
+        [x, y, pseudo_face_depth(face, point) * 0.46]
+    }
+
+    fn canonical_face_coordinates(face: &facefeature::FaceGeometry, point: Point) -> (f64, f64) {
+        let bounds = face.bounding_box;
+        let center = Point {
+            x: bounds.x + bounds.width * 0.5,
+            y: bounds.y + bounds.height * 0.5,
+        };
+        let roll = face.roll_radians.unwrap_or(0.0);
+        let (roll_sin, roll_cos) = roll.sin_cos();
+        let offset_x = point.x - center.x;
+        let offset_y = point.y - center.y;
+        let unrolled_x = offset_x * roll_cos + offset_y * roll_sin;
+        let unrolled_y = -offset_x * roll_sin + offset_y * roll_cos;
+        (
+            unrolled_x / (bounds.width * 0.54).max(f64::EPSILON),
+            unrolled_y / (bounds.height * 0.58).max(f64::EPSILON),
+        )
     }
 
     fn feature_depth_weight(point: Point, center: Point, radius_x: f64, radius_y: f64) -> f64 {
@@ -2251,7 +2283,7 @@ mod macos {
                     points: vec![Point { x: 0.5, y: 0.5 }],
                 },
             ];
-            let face = facefeature::FaceGeometry {
+            let mut face = facefeature::FaceGeometry {
                 confidence: 0.99,
                 landmark_confidence: 0.99,
                 bounding_box: bounds,
@@ -2264,6 +2296,11 @@ mod macos {
             let nose_depth = pseudo_face_depth(&face, Point { x: 0.5, y: 0.5 });
             let edge_depth = pseudo_face_depth(&face, Point { x: 0.2, y: 0.5 });
             assert!(nose_depth > edge_depth + 0.5);
+            let outside_depth = pseudo_face_depth(&face, Point { x: 0.08, y: 0.5 });
+            assert!(outside_depth >= 0.08);
+            face.yaw_radians = Some((-45.0_f64).to_radians());
+            let profile_edge_depth = pseudo_face_depth(&face, Point { x: 0.2, y: 0.5 });
+            assert!((profile_edge_depth - edge_depth).abs() < 1e-12);
             assert_eq!(shade_band(0.0, DEPTH_LAYER_COUNT), 0);
             assert_eq!(shade_band(1.0, DEPTH_LAYER_COUNT), DEPTH_LAYER_COUNT - 1);
             assert_eq!(shade_band(0.5, DEPTH_LAYER_COUNT), 4);
