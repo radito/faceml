@@ -47,6 +47,29 @@ smoothed cheek, jaw, nose, eye, mouth, and estimated forehead geometry:
 cargo run --release --bin facefeature-camera -- --face-mask polygon
 ```
 
+Hide the camera image while retaining the generated geometry, mesh, labels, and capture prompts on
+a dark background:
+
+```sh
+cargo run --release --bin facefeature-camera -- --face-mask polygon --mask-only
+```
+
+`--mask-only` changes presentation only. Camera frames are still captured privately inside the
+process for Vision detection and optional face-ID embedding, and are never written by this flag.
+
+Render the same geometry as a pseudo-3D wireframe with smoothly graded surface lighting:
+
+```sh
+cargo run --release --bin facefeature-camera -- --face-mask depth --mask-only
+```
+
+Depth mode fits an ellipsoid to the face box, pushes the detected nose and lips forward, recesses
+the eye regions, and biases the near cheek using Vision's yaw. Triangle normals illuminate eight
+subtle intensity layers, averaging the two adjacent surfaces at shared edges to avoid the harsh
+three-band heatmap effect. Raw Vision landmark outlines are also drawn more softly in this mode.
+This is an inferred artistic Z value from a monocular camera, not measured physical depth, and it
+is used only for rendering.
+
 Several roll-aware synthetic forehead rows close the region that Apple Vision does not directly
 landmark. Their width uses the contour's temple endpoints rather than roll-sensitive jaw extrema,
 and their height is capped from measured eye-to-chin distance. The eyes and inner mouth remain

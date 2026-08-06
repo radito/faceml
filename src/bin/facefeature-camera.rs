@@ -30,7 +30,7 @@ mod macos {
         AVCaptureVideoDataOutput, AVCaptureVideoDataOutputSampleBufferDelegate,
         AVCaptureVideoPreviewLayer, AVLayerVideoGravityResizeAspectFill, AVMediaTypeVideo,
     };
-    use objc2_core_foundation::{CFString, CGPoint, CGRect, CGSize};
+    use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGRect, CGSize};
     use objc2_core_graphics::{CGColor, CGMutablePath};
     use objc2_core_media::CMSampleBuffer;
     use objc2_core_video::{
@@ -52,11 +52,13 @@ mod macos {
     const FRAME_INTERVAL: Duration = Duration::from_millis(33);
     const LABEL_INTERVAL: Duration = Duration::from_millis(200);
     const PRESENTATION_DELAY_SECONDS: f64 = 1.0 / 60.0;
+    const DEPTH_LAYER_COUNT: usize = 8;
 
     #[derive(Debug)]
     struct FrameDelegateIvars {
         preview_layer: usize,
-        face_mask_layer: Option<usize>,
+        face_mask_layers: Vec<usize>,
+        face_mask_mode: FaceMaskMode,
         overlay_layer: usize,
         last_processed: Mutex<Option<Instant>>,
         last_label_refresh: Mutex<Option<Instant>>,
@@ -93,13 +95,18 @@ mod macos {
     impl FrameDelegate {
         fn new(
             preview_layer: &Retained<AVCaptureVideoPreviewLayer>,
-            face_mask_layer: Option<&Retained<CAShapeLayer>>,
+            face_mask_layers: &[Retained<CAShapeLayer>],
+            face_mask_mode: FaceMaskMode,
             overlay_layer: &Retained<CAShapeLayer>,
             face_id: Option<Arc<FaceIdClient>>,
         ) -> Retained<Self> {
             let ivars = FrameDelegateIvars {
                 preview_layer: Retained::as_ptr(preview_layer) as usize,
-                face_mask_layer: face_mask_layer.map(|layer| Retained::as_ptr(layer) as usize),
+                face_mask_layers: face_mask_layers
+                    .iter()
+                    .map(|layer| Retained::as_ptr(layer) as usize)
+                    .collect(),
+                face_mask_mode,
                 overlay_layer: Retained::as_ptr(overlay_layer) as usize,
                 last_processed: Mutex::new(None),
                 last_label_refresh: Mutex::new(None),
@@ -190,16 +197,20 @@ mod macos {
             };
 
             let preview_layer = self.ivars().preview_layer;
-            let face_mask_layer = self.ivars().face_mask_layer;
+            let face_mask_layers = self.ivars().face_mask_layers.clone();
+            let face_mask_mode = self.ivars().face_mask_mode;
             let overlay_layer = self.ivars().overlay_layer;
             DispatchQueue::main().exec_async(move || {
                 let preview = unsafe { &*(preview_layer as *const AVCaptureVideoPreviewLayer) };
-                let face_mask =
-                    face_mask_layer.map(|layer| unsafe { &*(layer as *const CAShapeLayer) });
+                let face_mask_layers = face_mask_layers
+                    .iter()
+                    .map(|layer| unsafe { &*(*layer as *const CAShapeLayer) })
+                    .collect::<Vec<_>>();
                 let overlay = unsafe { &*(overlay_layer as *const CAShapeLayer) };
                 update_overlay(
                     preview,
-                    face_mask,
+                    &face_mask_layers,
+                    face_mask_mode,
                     overlay,
                     &tracked_faces,
                     &face_id_matches,
@@ -216,12 +227,13 @@ mod macos {
         window: OnceCell<Retained<NSWindow>>,
         session: OnceCell<Retained<AVCaptureSession>>,
         preview_layer: OnceCell<Retained<AVCaptureVideoPreviewLayer>>,
-        face_mask_layer: OnceCell<Retained<CAShapeLayer>>,
+        face_mask_layers: OnceCell<Vec<Retained<CAShapeLayer>>>,
         overlay_layer: OnceCell<Retained<CAShapeLayer>>,
         frame_delegate: OnceCell<Retained<FrameDelegate>>,
         video_output: OnceCell<Retained<AVCaptureVideoDataOutput>>,
         face_id: Option<Arc<FaceIdClient>>,
         face_mask: FaceMaskMode,
+        mask_only: bool,
     }
 
     define_class!(
@@ -269,10 +281,12 @@ mod macos {
             mtm: MainThreadMarker,
             face_id: Option<Arc<FaceIdClient>>,
             face_mask: FaceMaskMode,
+            mask_only: bool,
         ) -> Retained<Self> {
             let this = Self::alloc(mtm).set_ivars(AppDelegateIvars {
                 face_id,
                 face_mask,
+                mask_only,
                 ..AppDelegateIvars::default()
             });
             unsafe { msg_send![super(this), init] }
@@ -341,46 +355,67 @@ mod macos {
             if let Some(gravity) = unsafe { AVLayerVideoGravityResizeAspectFill } {
                 unsafe { preview.setVideoGravity(gravity) };
             }
+            if self.ivars().mask_only {
+                let background = CGColor::new_generic_rgb(0.005, 0.012, 0.009, 1.0);
+                root_layer.setBackgroundColor(Some(&background));
+                preview.setHidden(true);
+            }
             disable_mirroring(unsafe { preview.connection() });
             disable_mirroring(unsafe { output.connectionWithMediaType(video_type) });
 
             let overlay = CAShapeLayer::layer();
-            let green = CGColor::new_generic_rgb(0.15, 1.0, 0.42, 0.95);
+            let (overlay_alpha, overlay_width) = if self.ivars().face_mask == FaceMaskMode::Depth {
+                (0.70, 1.15)
+            } else {
+                (0.95, 2.0)
+            };
+            let green = CGColor::new_generic_rgb(0.15, 1.0, 0.42, overlay_alpha);
             overlay.setStrokeColor(Some(&green));
             overlay.setFillColor(None);
-            overlay.setLineWidth(2.0);
+            overlay.setLineWidth(overlay_width);
             unsafe {
                 overlay.setLineCap(kCALineCapRound);
                 overlay.setLineJoin(kCALineJoinRound);
             }
 
-            let face_mask = (self.ivars().face_mask == FaceMaskMode::Polygon).then(|| {
+            let make_mask_layer = |alpha: f64, width: f64| {
                 let layer = CAShapeLayer::layer();
-                let stroke = CGColor::new_generic_rgb(0.15, 1.0, 0.42, 0.72);
+                let stroke = CGColor::new_generic_rgb(0.15, 1.0, 0.42, alpha);
                 layer.setFillColor(None);
                 layer.setStrokeColor(Some(&stroke));
-                layer.setLineWidth(0.85);
+                layer.setLineWidth(width);
                 unsafe {
                     layer.setLineCap(kCALineCapRound);
                     layer.setLineJoin(kCALineJoinRound);
                 }
                 layer
-            });
+            };
+            let face_mask_layers = match self.ivars().face_mask {
+                FaceMaskMode::None => Vec::new(),
+                FaceMaskMode::Polygon => vec![make_mask_layer(0.72, 0.85)],
+                FaceMaskMode::Depth => (0..DEPTH_LAYER_COUNT)
+                    .map(|index| {
+                        let intensity = index as f64 / (DEPTH_LAYER_COUNT - 1) as f64;
+                        make_mask_layer(0.22 + intensity * 0.56, 0.58 + intensity * 0.26)
+                    })
+                    .collect(),
+            };
 
             preview.setFrame(content_view.bounds());
-            if let Some(face_mask) = &face_mask {
-                face_mask.setFrame(content_view.bounds());
+            for face_mask_layer in &face_mask_layers {
+                face_mask_layer.setFrame(content_view.bounds());
             }
             overlay.setFrame(content_view.bounds());
             root_layer.addSublayer(&preview);
-            if let Some(face_mask) = &face_mask {
-                root_layer.addSublayer(face_mask);
+            for face_mask_layer in &face_mask_layers {
+                root_layer.addSublayer(face_mask_layer);
             }
             root_layer.addSublayer(&overlay);
 
             let frame_delegate = FrameDelegate::new(
                 &preview,
-                face_mask.as_ref(),
+                &face_mask_layers,
+                self.ivars().face_mask,
                 &overlay,
                 self.ivars().face_id.clone(),
             );
@@ -396,9 +431,7 @@ mod macos {
             self.ivars().window.set(window.clone()).unwrap();
             self.ivars().session.set(session.clone()).unwrap();
             self.ivars().preview_layer.set(preview).unwrap();
-            if let Some(face_mask) = face_mask {
-                self.ivars().face_mask_layer.set(face_mask).unwrap();
-            }
+            self.ivars().face_mask_layers.set(face_mask_layers).unwrap();
             self.ivars().overlay_layer.set(overlay).unwrap();
             self.ivars().frame_delegate.set(frame_delegate).unwrap();
             self.ivars().video_output.set(output).unwrap();
@@ -431,8 +464,10 @@ mod macos {
             if let Some(preview) = self.ivars().preview_layer.get() {
                 preview.setFrame(bounds);
             }
-            if let Some(face_mask) = self.ivars().face_mask_layer.get() {
-                face_mask.setFrame(bounds);
+            if let Some(face_mask_layers) = self.ivars().face_mask_layers.get() {
+                for face_mask_layer in face_mask_layers {
+                    face_mask_layer.setFrame(bounds);
+                }
             }
             if let Some(overlay) = self.ivars().overlay_layer.get() {
                 overlay.setFrame(bounds);
@@ -602,7 +637,8 @@ mod macos {
 
     fn update_overlay(
         preview: &AVCaptureVideoPreviewLayer,
-        face_mask: Option<&CAShapeLayer>,
+        face_mask_layers: &[&CAShapeLayer],
+        face_mask_mode: FaceMaskMode,
         overlay: &CAShapeLayer,
         tracked_faces: &[TrackedFace],
         face_id_matches: &HashMap<u64, FaceIdentityMatch>,
@@ -610,13 +646,23 @@ mod macos {
         refresh_labels: bool,
         inference_milliseconds: f64,
     ) {
-        let face_mask_path = face_mask.map(|_| {
-            let path = CGMutablePath::new();
-            for tracked_face in tracked_faces {
-                add_polygon_face_mask(&path, preview, &tracked_face.geometry);
+        let face_mask_paths = face_mask_layers
+            .iter()
+            .map(|_| CGMutablePath::new())
+            .collect::<Vec<_>>();
+        for tracked_face in tracked_faces {
+            match face_mask_mode {
+                FaceMaskMode::None => {}
+                FaceMaskMode::Polygon => {
+                    if let Some(path) = face_mask_paths.first() {
+                        add_polygon_face_mask(path, preview, &tracked_face.geometry);
+                    }
+                }
+                FaceMaskMode::Depth => {
+                    add_depth_face_mask(&face_mask_paths, preview, &tracked_face.geometry);
+                }
             }
-            path
-        });
+        }
         let path = CGMutablePath::new();
         for tracked_face in tracked_faces {
             let face = &tracked_face.geometry;
@@ -638,8 +684,8 @@ mod macos {
 
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        if let (Some(face_mask), Some(face_mask_path)) = (face_mask, face_mask_path) {
-            face_mask.setPath(Some(&face_mask_path));
+        for (layer, path) in face_mask_layers.iter().zip(&face_mask_paths) {
+            layer.setPath(Some(&path));
         }
         overlay.setPath(Some(&path));
         if refresh_labels {
@@ -949,6 +995,165 @@ mod macos {
         }
     }
 
+    fn add_depth_face_mask(
+        paths: &[CFRetained<CGMutablePath>],
+        preview: &AVCaptureVideoPreviewLayer,
+        face: &facefeature::FaceGeometry,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let Some(mesh) = polygon_face_mesh(face) else {
+            return;
+        };
+        let depths = mesh
+            .vertices
+            .iter()
+            .map(|point| pseudo_face_depth(face, *point))
+            .collect::<Vec<_>>();
+        let mut edge_brightness = BTreeMap::<(usize, usize), (f64, usize)>::new();
+        for triangle in &mesh.triangles {
+            let brightness = triangle_surface_brightness(face, &mesh, &depths, *triangle);
+            for (left, right) in [
+                (triangle[0], triangle[1]),
+                (triangle[1], triangle[2]),
+                (triangle[2], triangle[0]),
+            ] {
+                let edge = if left < right {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                let accumulated = edge_brightness.entry(edge).or_insert((0.0, 0));
+                accumulated.0 += brightness;
+                accumulated.1 += 1;
+            }
+        }
+        for ((left, right), (brightness_sum, triangle_count)) in edge_brightness {
+            let brightness = brightness_sum / triangle_count as f64;
+            let path = &paths[shade_band(brightness, paths.len())];
+            let first = layer_point(preview, mesh.vertices[left]);
+            let second = layer_point(preview, mesh.vertices[right]);
+            unsafe {
+                CGMutablePath::move_to_point(Some(path), std::ptr::null(), first.x, first.y);
+                CGMutablePath::add_line_to_point(Some(path), std::ptr::null(), second.x, second.y);
+            }
+        }
+    }
+
+    fn triangle_surface_brightness(
+        face: &facefeature::FaceGeometry,
+        mesh: &PolygonFaceMesh,
+        depths: &[f64],
+        triangle: [usize; 3],
+    ) -> f64 {
+        let bounds = face.bounding_box;
+        if bounds.width <= f64::EPSILON || bounds.height <= f64::EPSILON {
+            return 0.35;
+        }
+        let vertex = |index: usize| {
+            let point = mesh.vertices[index];
+            [
+                (point.x - bounds.x) / bounds.width,
+                (point.y - bounds.y) / bounds.height,
+                depths[index] * 0.42,
+            ]
+        };
+        let first = vertex(triangle[0]);
+        let second = vertex(triangle[1]);
+        let third = vertex(triangle[2]);
+        let left = [
+            second[0] - first[0],
+            second[1] - first[1],
+            second[2] - first[2],
+        ];
+        let right = [
+            third[0] - first[0],
+            third[1] - first[1],
+            third[2] - first[2],
+        ];
+        let mut normal = [
+            left[1] * right[2] - left[2] * right[1],
+            left[2] * right[0] - left[0] * right[2],
+            left[0] * right[1] - left[1] * right[0],
+        ];
+        if normal[2] < 0.0 {
+            normal = [-normal[0], -normal[1], -normal[2]];
+        }
+        let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        if length <= f64::EPSILON {
+            return 0.35;
+        }
+        normal = [normal[0] / length, normal[1] / length, normal[2] / length];
+        let light = [-0.24, 0.18, 0.954];
+        let diffuse =
+            (normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2]).clamp(0.0, 1.0);
+        let average_depth = (depths[triangle[0]] + depths[triangle[1]] + depths[triangle[2]]) / 3.0;
+        (0.28 + diffuse * 0.57 + average_depth * 0.15).clamp(0.0, 1.0)
+    }
+
+    fn pseudo_face_depth(face: &facefeature::FaceGeometry, point: Point) -> f64 {
+        let bounds = face.bounding_box;
+        if bounds.width <= f64::EPSILON || bounds.height <= f64::EPSILON {
+            return 0.0;
+        }
+        let center = Point {
+            x: bounds.x + bounds.width * 0.5,
+            y: bounds.y + bounds.height * 0.5,
+        };
+        let normalized_x = (point.x - center.x) / (bounds.width * 0.54);
+        let normalized_y = (point.y - center.y) / (bounds.height * 0.58);
+        let ellipsoid = (1.0 - normalized_x * normalized_x - normalized_y * normalized_y)
+            .max(0.0)
+            .sqrt();
+        let mut depth = ellipsoid * 0.78;
+
+        if let Some(nose) = landmark_center(face, LandmarkKind::Nose)
+            .or_else(|| landmark_center(face, LandmarkKind::NoseCrest))
+        {
+            depth +=
+                0.34 * feature_depth_weight(point, nose, bounds.width * 0.15, bounds.height * 0.20);
+        }
+        if let Some(mouth) = landmark_center(face, LandmarkKind::OuterLips) {
+            depth += 0.10
+                * feature_depth_weight(point, mouth, bounds.width * 0.23, bounds.height * 0.12);
+        }
+        for eye in [
+            landmark_center(face, LandmarkKind::LeftEye),
+            landmark_center(face, LandmarkKind::RightEye),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            depth -=
+                0.09 * feature_depth_weight(point, eye, bounds.width * 0.16, bounds.height * 0.10);
+        }
+
+        // A turned face presents one cheek closer to the viewer. This small pose-dependent bias
+        // makes the depth bands travel across the wireframe instead of remaining frontally flat.
+        if let Some(yaw) = face.yaw_radians {
+            depth -= normalized_x * yaw.sin() * 0.16;
+        }
+        depth.clamp(0.0, 1.0)
+    }
+
+    fn feature_depth_weight(point: Point, center: Point, radius_x: f64, radius_y: f64) -> f64 {
+        if radius_x <= f64::EPSILON || radius_y <= f64::EPSILON {
+            return 0.0;
+        }
+        let x = (point.x - center.x) / radius_x;
+        let y = (point.y - center.y) / radius_y;
+        (-0.5 * (x * x + y * y)).exp()
+    }
+
+    fn shade_band(brightness: f64, layer_count: usize) -> usize {
+        if layer_count <= 1 {
+            return 0;
+        }
+        ((brightness.clamp(0.0, 1.0) * (layer_count - 1) as f64).round() as usize)
+            .min(layer_count - 1)
+    }
+
     #[derive(Debug)]
     struct PolygonFaceMesh {
         vertices: Vec<Point>,
@@ -972,6 +1177,23 @@ mod macos {
                     .flat_map(|region| region.points.iter().copied())
                     .collect()
             });
+        // `allPoints` is convenient for the dense base mesh, but at steep yaw it can omit the
+        // outermost samples used by Vision's dedicated eye/eyebrow regions. Keep those feature
+        // points as exact mesh anchors so the generated surface meets the landmark overlay.
+        vertices.extend(
+            face.landmarks
+                .iter()
+                .filter(|region| {
+                    matches!(
+                        region.kind,
+                        LandmarkKind::LeftEye
+                            | LandmarkKind::RightEye
+                            | LandmarkKind::LeftEyebrow
+                            | LandmarkKind::RightEyebrow
+                    )
+                })
+                .flat_map(|region| region.points.iter().copied()),
+        );
         deduplicate_mesh_vertices(&mut vertices, bounds.width, bounds.height);
         add_forehead_mesh_vertices(face, &mut vertices);
         apply_yaw_visibility_warp(face, &mut vertices);
@@ -1171,20 +1393,87 @@ mod macos {
         }
         let margin = face.bounding_box.width
             * (FRONTAL_MARGIN + (PROFILE_MARGIN - FRONTAL_MARGIN) * strength);
+        let eye_envelope = eye_feature_envelope(face);
         for vertex in vertices {
             let center_x = interpolate_axis_x(&axis, vertex.y);
             if yaw_degrees > 0.0 {
-                let limit = center_x + margin;
+                let mut limit = center_x + margin;
+                if let Some(envelope) = eye_envelope {
+                    let influence = envelope.vertical_influence(vertex.y, face.bounding_box.height);
+                    let feature_limit = envelope.max_x + face.bounding_box.width * 0.018;
+                    let expanded_limit = limit.max(feature_limit);
+                    limit += (expanded_limit - limit) * influence;
+                }
                 if vertex.x > limit {
                     vertex.x = limit + (vertex.x - limit) * (1.0 - strength);
                 }
             } else {
-                let limit = center_x - margin;
+                let mut limit = center_x - margin;
+                if let Some(envelope) = eye_envelope {
+                    let influence = envelope.vertical_influence(vertex.y, face.bounding_box.height);
+                    let feature_limit = envelope.min_x - face.bounding_box.width * 0.018;
+                    let expanded_limit = limit.min(feature_limit);
+                    limit += (expanded_limit - limit) * influence;
+                }
                 if vertex.x < limit {
                     vertex.x = limit + (vertex.x - limit) * (1.0 - strength);
                 }
             }
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct EyeFeatureEnvelope {
+        min_x: f64,
+        max_x: f64,
+        min_y: f64,
+        max_y: f64,
+    }
+
+    impl EyeFeatureEnvelope {
+        fn vertical_influence(self, y: f64, face_height: f64) -> f64 {
+            let distance = if y < self.min_y {
+                self.min_y - y
+            } else if y > self.max_y {
+                y - self.max_y
+            } else {
+                return 1.0;
+            };
+            let taper = (face_height * 0.07).max(f64::EPSILON);
+            (1.0 - distance / taper).clamp(0.0, 1.0)
+        }
+    }
+
+    fn eye_feature_envelope(face: &facefeature::FaceGeometry) -> Option<EyeFeatureEnvelope> {
+        let mut points = face
+            .landmarks
+            .iter()
+            .filter(|region| {
+                matches!(
+                    region.kind,
+                    LandmarkKind::LeftEye
+                        | LandmarkKind::RightEye
+                        | LandmarkKind::LeftEyebrow
+                        | LandmarkKind::RightEyebrow
+                )
+            })
+            .flat_map(|region| region.points.iter().copied());
+        let first = points.next()?;
+        Some(points.fold(
+            EyeFeatureEnvelope {
+                min_x: first.x,
+                max_x: first.x,
+                min_y: first.y,
+                max_y: first.y,
+            },
+            |mut envelope, point| {
+                envelope.min_x = envelope.min_x.min(point.x);
+                envelope.max_x = envelope.max_x.max(point.x);
+                envelope.min_y = envelope.min_y.min(point.y);
+                envelope.max_y = envelope.max_y.max(point.y);
+                envelope
+            },
+        ))
     }
 
     fn yaw_visibility_axis(face: &facefeature::FaceGeometry) -> Vec<Point> {
@@ -1484,6 +1773,7 @@ mod macos {
         #[default]
         None,
         Polygon,
+        Depth,
     }
 
     #[derive(Debug, Default, PartialEq)]
@@ -1495,6 +1785,7 @@ mod macos {
         capture_target: Option<FaceCaptureTarget>,
         benchmark_iterations: Option<usize>,
         face_mask: FaceMaskMode,
+        mask_only: bool,
         show_help: bool,
     }
 
@@ -1566,13 +1857,17 @@ mod macos {
                 "--face-mask" => {
                     let value = arguments
                         .next()
-                        .ok_or("--face-mask requires polygon or none")?;
+                        .ok_or("--face-mask requires polygon, depth, or none")?;
                     options.face_mask = match value.as_str() {
                         "polygon" => FaceMaskMode::Polygon,
+                        "depth" => FaceMaskMode::Depth,
                         "none" => FaceMaskMode::None,
-                        _ => return Err("--face-mask requires polygon or none".to_owned()),
+                        _ => {
+                            return Err("--face-mask requires polygon, depth, or none".to_owned());
+                        }
                     };
                 }
+                "--mask-only" => options.mask_only = true,
                 "--name" => {
                     let name = arguments.next().ok_or("--name requires a value")?;
                     if name.trim().is_empty() {
@@ -1622,7 +1917,7 @@ mod macos {
 
     fn print_help() {
         println!(
-            "facefeature-camera\n\nUSAGE:\n    facefeature-camera [OPTIONS]\n    facefeature-camera --face-id [OPTIONS]\n    facefeature-camera --read-only [OPTIONS]\n    facefeature-camera --capture (--name NAME | --person ID) [OPTIONS]\n    facefeature-camera --benchmark [OPTIONS]\n\nOPTIONS:\n    --face-id                 Automatic matching and enrollment\n    --read-only               Match from SQLite without inserting or updating rows\n    --capture                 Guided center/left/right/up/down enrollment\n    --name NAME               Create a new named identity during guided capture\n    --person ID               Replace/add guided samples for an existing identity\n    --face-mask MODE          Face overlay: polygon or none (default)\n    --benchmark               Benchmark headless SFace/Core ML inference\n    --benchmark-iterations N  Timed iterations (default: 100)\n    --face-id-model PATH      Use a custom SFace ONNX model\n    --face-id-db PATH         Use a custom SQLite identity gallery path\n    -h, --help                Print this help"
+            "facefeature-camera\n\nUSAGE:\n    facefeature-camera [OPTIONS]\n    facefeature-camera --face-id [OPTIONS]\n    facefeature-camera --read-only [OPTIONS]\n    facefeature-camera --capture (--name NAME | --person ID) [OPTIONS]\n    facefeature-camera --benchmark [OPTIONS]\n\nOPTIONS:\n    --face-id                 Automatic matching and enrollment\n    --read-only               Match from SQLite without inserting or updating rows\n    --capture                 Guided center/left/right/up/down enrollment\n    --name NAME               Create a new named identity during guided capture\n    --person ID               Replace/add guided samples for an existing identity\n    --face-mask MODE          Face overlay: polygon, depth, or none (default)\n    --mask-only               Hide the camera image; retain generated overlays\n    --benchmark               Benchmark headless SFace/Core ML inference\n    --benchmark-iterations N  Timed iterations (default: 100)\n    --face-id-model PATH      Use a custom SFace ONNX model\n    --face-id-db PATH         Use a custom SQLite identity gallery path\n    -h, --help                Print this help"
         );
     }
 
@@ -1746,7 +2041,7 @@ mod macos {
         ensure_camera_access()?;
         let mtm = MainThreadMarker::new().ok_or("camera UI must start on the main thread")?;
         let app = NSApplication::sharedApplication(mtm);
-        let delegate = AppDelegate::new(mtm, face_id, options.face_mask);
+        let delegate = AppDelegate::new(mtm, face_id, options.face_mask, options.mask_only);
         app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         app.run();
         Ok(())
@@ -1906,9 +2201,72 @@ mod macos {
         }
 
         #[test]
+        fn mask_only_hides_only_the_camera_presentation() {
+            let options = parse_options([
+                "--mask-only".to_owned(),
+                "--face-mask".to_owned(),
+                "polygon".to_owned(),
+                "--face-id".to_owned(),
+            ])
+            .unwrap();
+            assert!(options.mask_only);
+            assert_eq!(options.face_mask, FaceMaskMode::Polygon);
+            assert!(options.face_id_model.is_some());
+            assert!(options.face_id_database.is_some());
+        }
+
+        #[test]
+        fn depth_face_mask_is_available_with_mask_only() {
+            let options = parse_options([
+                "--face-mask".to_owned(),
+                "depth".to_owned(),
+                "--mask-only".to_owned(),
+            ])
+            .unwrap();
+            assert_eq!(options.face_mask, FaceMaskMode::Depth);
+            assert!(options.mask_only);
+        }
+
+        #[test]
         fn face_mask_rejects_unknown_modes() {
             let error = parse_options(["--face-mask".to_owned(), "metal".to_owned()]).unwrap_err();
-            assert_eq!(error, "--face-mask requires polygon or none");
+            assert_eq!(error, "--face-mask requires polygon, depth, or none");
+        }
+
+        #[test]
+        fn pseudo_depth_places_the_nose_in_front_of_the_face_edge() {
+            let bounds = facefeature::BoundingBox {
+                x: 0.2,
+                y: 0.1,
+                width: 0.6,
+                height: 0.8,
+            };
+            let landmarks = vec![
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::FaceContour,
+                    points: vec![Point { x: 0.2, y: 0.5 }, Point { x: 0.5, y: 0.1 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::Nose,
+                    points: vec![Point { x: 0.5, y: 0.5 }],
+                },
+            ];
+            let face = facefeature::FaceGeometry {
+                confidence: 0.99,
+                landmark_confidence: 0.99,
+                bounding_box: bounds,
+                roll_radians: None,
+                yaw_radians: Some(0.0),
+                pitch_radians: None,
+                measurements: facefeature::FaceGeometry::calculate_measurements(bounds, &landmarks),
+                landmarks,
+            };
+            let nose_depth = pseudo_face_depth(&face, Point { x: 0.5, y: 0.5 });
+            let edge_depth = pseudo_face_depth(&face, Point { x: 0.2, y: 0.5 });
+            assert!(nose_depth > edge_depth + 0.5);
+            assert_eq!(shade_band(0.0, DEPTH_LAYER_COUNT), 0);
+            assert_eq!(shade_band(1.0, DEPTH_LAYER_COUNT), DEPTH_LAYER_COUNT - 1);
+            assert_eq!(shade_band(0.5, DEPTH_LAYER_COUNT), 4);
         }
 
         #[test]
@@ -2068,6 +2426,69 @@ mod macos {
             apply_yaw_visibility_warp(&opposite_face, &mut opposite_vertices);
             assert!((opposite_vertices[0].x - 0.67).abs() < 1e-12);
             assert!(opposite_vertices[1].x >= 0.369);
+        }
+
+        #[test]
+        fn yaw_warp_preserves_eye_and_eyebrow_envelope_without_restoring_the_wing() {
+            let bounds = facefeature::BoundingBox {
+                x: 0.2,
+                y: 0.1,
+                width: 0.5,
+                height: 0.7,
+            };
+            let landmarks = vec![
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::FaceContour,
+                    points: vec![Point { x: 0.23, y: 0.55 }, Point { x: 0.45, y: 0.13 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::LeftEye,
+                    points: vec![Point { x: 0.31, y: 0.65 }, Point { x: 0.37, y: 0.66 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::RightEye,
+                    points: vec![Point { x: 0.53, y: 0.66 }, Point { x: 0.59, y: 0.65 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::LeftEyebrow,
+                    points: vec![Point { x: 0.30, y: 0.71 }, Point { x: 0.38, y: 0.72 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::RightEyebrow,
+                    points: vec![Point { x: 0.52, y: 0.72 }, Point { x: 0.60, y: 0.71 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::Nose,
+                    points: vec![Point { x: 0.45, y: 0.45 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::OuterLips,
+                    points: vec![Point { x: 0.45, y: 0.30 }],
+                },
+            ];
+            let mut face = facefeature::FaceGeometry {
+                confidence: 0.99,
+                landmark_confidence: 0.99,
+                bounding_box: bounds,
+                roll_radians: None,
+                yaw_radians: Some((-45.0_f64).to_radians()),
+                pitch_radians: None,
+                measurements: facefeature::FaceGeometry::calculate_measurements(bounds, &landmarks),
+                landmarks,
+            };
+
+            let mut left_profile_vertices =
+                vec![Point { x: 0.30, y: 0.71 }, Point { x: 0.23, y: 0.50 }];
+            apply_yaw_visibility_warp(&face, &mut left_profile_vertices);
+            assert!((left_profile_vertices[0].x - 0.30).abs() < 1e-12);
+            assert!(left_profile_vertices[1].x >= 0.36);
+
+            face.yaw_radians = Some(45.0_f64.to_radians());
+            let mut right_profile_vertices =
+                vec![Point { x: 0.60, y: 0.71 }, Point { x: 0.67, y: 0.50 }];
+            apply_yaw_visibility_warp(&face, &mut right_profile_vertices);
+            assert!((right_profile_vertices[0].x - 0.60).abs() < 1e-12);
+            assert!(right_profile_vertices[1].x <= 0.54);
         }
 
         #[test]
