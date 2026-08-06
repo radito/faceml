@@ -61,8 +61,10 @@ cargo run --release --bin facefeature-camera -- --capture --name "Radit"
 
 The overlay guides the subject through straight, left, right, up, and down poses. It requires a
 stable hold, captures three embeddings per pose, and shows yaw, pitch, detection quality, and
-progress. All 15 pose samples are held in memory and committed together only after capture
-completes. Recognition loads five averaged pose templates per identity and selects only the
+progress. Guided capture accepts exactly one visible face; zero or multiple detected faces block
+sampling and turn the instruction banner red. Invalid pose/quality and capture pipeline errors use
+the same red warning state. All 15 pose samples are held in memory and committed together after
+capture completes. Recognition loads five averaged pose templates per identity and selects only the
 center, horizontal, or vertical template group relevant to the live head pose, alongside the main
 centroid. To replace/add guided templates for an existing identity:
 
@@ -85,6 +87,39 @@ cargo run --release --bin facefeature-camera -- --read-only
 In read-only mode, matched people retain their stored identity and unmatched faces appear as
 `Unknown`; no identities are inserted and no centroids, counters, names, or timestamps are updated.
 `--read-only` and `--capture` cannot be combined. Both flags enable the face-ID pipeline.
+
+Benchmark the actual headless SFace/Core ML path on the current Mac without opening the camera:
+
+```sh
+cargo run --release --bin facefeature-camera -- --benchmark
+```
+
+The report separates Core ML session initialization, the first inference, and steady-state average,
+median, p95, min/max, and throughput. Change the timed sample count with
+`--benchmark-iterations N`. This uses a deterministic synthetic 112x112 input, so it measures the
+embedding stage rather than AVFoundation capture, Apple Vision detection, alignment, or rendering.
+
+Tested on an 8 GB Apple M1 MacBook Air using the release build (100 measured runs after five
+warmups):
+
+```text
+SFace/Core ML benchmark
+hardware: MacBook Air | Apple M1 | arm64 | memory: 8 GB | macOS: 27.0
+model: models/face_recognition_sface_2021dec.onnx
+backend: CoreML | compute units: all | input: 1x3x112x112
+session initialization: 42.972 ms
+first inference:       8.357 ms
+steady state (100 runs after 5 warmups):
+  average:             7.956 ms
+  median (p50):        7.891 ms
+  p95:                 8.383 ms
+  min / max:           6.874 / 8.767 ms
+  throughput:          125.7 embeddings/s
+embedding dimensions:  128
+```
+
+These are representative results from one run; temperature, power mode, background load, Core ML
+cache state, and macOS version can change the measurements.
 
 For each new tracking ID, the program collects three quality-scored 112x112 aligned face crops at
 90 ms intervals and runs the bundled SFace MobileFaceNet model on a dedicated worker. If those

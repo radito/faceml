@@ -4,6 +4,7 @@ mod macos {
     use std::collections::HashMap;
     use std::env;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ mod macos {
     use facefeature::detector::apple_vision::AppleVisionDetector;
     use facefeature::face_id::{
         FaceCaptureStatus, FaceCaptureTarget, FaceIdClient, FaceIdDatabaseMode, FaceIdentityMatch,
-        aligned_sface_tensor_bgra, landmark_pitch_degrees,
+        aligned_sface_tensor_bgra, benchmark_sface_coreml, landmark_pitch_degrees,
     };
     use facefeature::{FaceTracker, LandmarkKind, Point, TrackedFace};
     use objc2::rc::Retained;
@@ -514,12 +515,16 @@ mod macos {
         tracked_faces: &[TrackedFace],
         client: &FaceIdClient,
     ) {
-        let Some(tracked_face) = tracked_faces.iter().max_by(|left, right| {
-            let left_area = left.geometry.bounding_box.width * left.geometry.bounding_box.height;
-            let right_area = right.geometry.bounding_box.width * right.geometry.bounding_box.height;
-            left_area.total_cmp(&right_area)
-        }) else {
-            return;
+        let tracked_face = match tracked_faces {
+            [] => {
+                client.report_capture_problem("NO FACE — move one person into view");
+                return;
+            }
+            [tracked_face] => tracked_face,
+            _ => {
+                client.report_capture_problem("MULTIPLE FACES — only one person is allowed");
+                return;
+            }
         };
         let Some(request) = client.capture_request(&tracked_face.geometry, Instant::now()) else {
             return;
@@ -698,12 +703,18 @@ mod macos {
         banner.setAlignmentMode(unsafe { objc2_quartz_core::kCAAlignmentCenter });
         banner.setWrapped(true);
         banner.setContentsScale(2.0);
-        let foreground = if status.completed {
+        let foreground = if status.alert {
+            CGColor::new_generic_rgb(1.0, 0.94, 0.94, 1.0)
+        } else if status.completed {
             CGColor::new_generic_rgb(0.7, 1.0, 0.75, 1.0)
         } else {
             CGColor::new_generic_rgb(1.0, 0.95, 0.72, 1.0)
         };
-        let background = CGColor::new_generic_rgb(0.02, 0.03, 0.04, 0.9);
+        let background = if status.alert {
+            CGColor::new_generic_rgb(0.72, 0.03, 0.04, 0.94)
+        } else {
+            CGColor::new_generic_rgb(0.02, 0.03, 0.04, 0.9)
+        };
         banner.setForegroundColor(Some(&foreground));
         banner.setBackgroundColor(Some(&background));
         banner.setCornerRadius(8.0);
@@ -902,6 +913,7 @@ mod macos {
         face_id_mode: Option<FaceIdDatabaseMode>,
         capture_requested: bool,
         capture_target: Option<FaceCaptureTarget>,
+        benchmark_iterations: Option<usize>,
         show_help: bool,
     }
 
@@ -950,6 +962,26 @@ mod macos {
                     options.capture_requested = true;
                     enable_face_id_defaults(&mut options);
                 }
+                "--benchmark" => {
+                    options.benchmark_iterations.get_or_insert(100);
+                    options.face_id_model.get_or_insert_with(|| {
+                        PathBuf::from("models/face_recognition_sface_2021dec.onnx")
+                    });
+                }
+                "--benchmark-iterations" => {
+                    let value = arguments
+                        .next()
+                        .ok_or("--benchmark-iterations requires a number")?;
+                    let iterations = value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|value| (1..=100_000).contains(value))
+                        .ok_or("--benchmark-iterations must be between 1 and 100000")?;
+                    options.benchmark_iterations = Some(iterations);
+                    options.face_id_model.get_or_insert_with(|| {
+                        PathBuf::from("models/face_recognition_sface_2021dec.onnx")
+                    });
+                }
                 "--name" => {
                     let name = arguments.next().ok_or("--name requires a value")?;
                     if name.trim().is_empty() {
@@ -982,6 +1014,9 @@ mod macos {
         if !options.capture_requested && options.capture_target.is_some() {
             return Err("--name and --person can only be used with --capture".to_owned());
         }
+        if options.capture_requested && options.benchmark_iterations.is_some() {
+            return Err("--benchmark and --capture cannot be used together".to_owned());
+        }
         Ok(options)
     }
 
@@ -996,8 +1031,82 @@ mod macos {
 
     fn print_help() {
         println!(
-            "facefeature-camera\n\nUSAGE:\n    facefeature-camera --face-id [OPTIONS]\n    facefeature-camera --read-only [OPTIONS]\n    facefeature-camera --capture (--name NAME | --person ID) [OPTIONS]\n\nOPTIONS:\n    --face-id             Automatic matching and enrollment\n    --read-only           Match from SQLite without inserting or updating rows\n    --capture             Guided center/left/right/up/down enrollment\n    --name NAME           Create a new named identity during guided capture\n    --person ID           Replace/add guided samples for an existing identity\n    --face-id-model PATH  Use a custom SFace ONNX model\n    --face-id-db PATH     Use a custom SQLite identity gallery path\n    -h, --help            Print this help"
+            "facefeature-camera\n\nUSAGE:\n    facefeature-camera --face-id [OPTIONS]\n    facefeature-camera --read-only [OPTIONS]\n    facefeature-camera --capture (--name NAME | --person ID) [OPTIONS]\n    facefeature-camera --benchmark [OPTIONS]\n\nOPTIONS:\n    --face-id                 Automatic matching and enrollment\n    --read-only               Match from SQLite without inserting or updating rows\n    --capture                 Guided center/left/right/up/down enrollment\n    --name NAME               Create a new named identity during guided capture\n    --person ID               Replace/add guided samples for an existing identity\n    --benchmark               Benchmark headless SFace/Core ML inference\n    --benchmark-iterations N  Timed iterations (default: 100)\n    --face-id-model PATH      Use a custom SFace ONNX model\n    --face-id-db PATH         Use a custom SQLite identity gallery path\n    -h, --help                Print this help"
         );
+    }
+
+    fn system_value(program: &str, arguments: &[&str]) -> String {
+        Command::new(program)
+            .args(arguments)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned())
+    }
+
+    fn hardware_summary() -> (String, String) {
+        let output = Command::new("/usr/sbin/system_profiler")
+            .args(["SPHardwareDataType", "-detailLevel", "mini"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .unwrap_or_default();
+        let field = |name: &str| {
+            output.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix(name)
+                    .map(|value| value.trim().to_owned())
+            })
+        };
+        let architecture = system_value("/usr/bin/uname", &["-m"]);
+        let chip = field("Chip:").unwrap_or_else(|| architecture.clone());
+        let model = field("Model Name:").unwrap_or_else(|| "Mac".to_owned());
+        let memory = field("Memory:").unwrap_or_else(|| "unknown".to_owned());
+        (format!("{model} | {chip} | {architecture}"), memory)
+    }
+
+    fn run_benchmark(model_path: &std::path::Path, iterations: usize) -> Result<(), String> {
+        let (hardware, memory) = hardware_summary();
+        let macos = system_value("/usr/bin/sw_vers", &["-productVersion"]);
+        let cache_dir = PathBuf::from("target/face-id-coreml-cache");
+        println!("SFace/Core ML benchmark");
+        println!("hardware: {hardware} | memory: {memory} | macOS: {macos}");
+        println!("model: {}", model_path.display());
+        println!("backend: CoreML | compute units: all | input: 1x3x112x112");
+        let report = benchmark_sface_coreml(model_path, &cache_dir, iterations)?;
+        println!(
+            "session initialization: {:.3} ms",
+            report.session_initialization_ms
+        );
+        println!("first inference:       {:.3} ms", report.first_inference_ms);
+        println!(
+            "steady state ({} runs after {} warmups):",
+            report.iterations, report.warmup_iterations
+        );
+        println!(
+            "  average:             {:.3} ms",
+            report.average_inference_ms
+        );
+        println!(
+            "  median (p50):        {:.3} ms",
+            report.median_inference_ms
+        );
+        println!("  p95:                 {:.3} ms", report.p95_inference_ms);
+        println!(
+            "  min / max:           {:.3} / {:.3} ms",
+            report.minimum_inference_ms, report.maximum_inference_ms
+        );
+        println!(
+            "  throughput:          {:.1} embeddings/s",
+            report.embeddings_per_second
+        );
+        println!("embedding dimensions:  {}", report.embedding_dimensions);
+        println!("note: synthetic input; this measures embedding compute, not camera or Vision");
+        Ok(())
     }
 
     pub fn run() -> Result<(), String> {
@@ -1005,6 +1114,13 @@ mod macos {
         if options.show_help {
             print_help();
             return Ok(());
+        }
+        if let Some(iterations) = options.benchmark_iterations {
+            let model_path = options
+                .face_id_model
+                .as_deref()
+                .ok_or("benchmark model path is unavailable")?;
+            return run_benchmark(model_path, iterations);
         }
         let face_id = options
             .face_id_model
@@ -1157,6 +1273,37 @@ mod macos {
                     name: "Radit".to_owned()
                 })
             );
+        }
+
+        #[test]
+        fn benchmark_is_headless_and_uses_the_bundled_model() {
+            let options = parse_options(["--benchmark".to_owned()]).unwrap();
+            assert_eq!(options.benchmark_iterations, Some(100));
+            assert_eq!(
+                options.face_id_model,
+                Some(PathBuf::from("models/face_recognition_sface_2021dec.onnx"))
+            );
+            assert!(options.face_id_database.is_none());
+        }
+
+        #[test]
+        fn benchmark_iterations_imply_benchmark_mode() {
+            let options =
+                parse_options(["--benchmark-iterations".to_owned(), "17".to_owned()]).unwrap();
+            assert_eq!(options.benchmark_iterations, Some(17));
+            assert!(options.face_id_model.is_some());
+        }
+
+        #[test]
+        fn benchmark_and_capture_conflict() {
+            let error = parse_options([
+                "--benchmark".to_owned(),
+                "--capture".to_owned(),
+                "--name".to_owned(),
+                "Test".to_owned(),
+            ])
+            .unwrap_err();
+            assert!(error.contains("cannot be used together"));
         }
 
         #[test]

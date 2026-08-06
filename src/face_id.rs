@@ -26,6 +26,21 @@ pub const SFACE_WIDTH: usize = 112;
 pub const SFACE_HEIGHT: usize = 112;
 pub const SFACE_COSINE_THRESHOLD: f32 = 0.363;
 
+#[derive(Clone, Debug)]
+pub struct SFaceBenchmarkReport {
+    pub iterations: usize,
+    pub warmup_iterations: usize,
+    pub session_initialization_ms: f64,
+    pub first_inference_ms: f64,
+    pub average_inference_ms: f64,
+    pub median_inference_ms: f64,
+    pub p95_inference_ms: f64,
+    pub minimum_inference_ms: f64,
+    pub maximum_inference_ms: f64,
+    pub embeddings_per_second: f64,
+    pub embedding_dimensions: usize,
+}
+
 const SFACE_TEMPLATE: [[f32; 2]; 5] = [
     [38.2946, 51.6963],
     [73.5318, 51.5014],
@@ -126,6 +141,8 @@ pub struct FaceCaptureStatus {
     pub pitch_estimated: bool,
     pub quality: f32,
     pub message: String,
+    /// The current frame cannot safely contribute an enrollment sample.
+    pub alert: bool,
     pub completed: bool,
 }
 
@@ -377,6 +394,17 @@ impl FaceIdClient {
                 .release_pending(message);
         }
     }
+
+    /// Reports a capture-blocking condition that is outside face geometry, such as an
+    /// invalid number of visible faces. An already queued single-face sample remains valid.
+    pub fn report_capture_problem(&self, message: &str) {
+        if let Some(capture) = &self.capture {
+            capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .report_problem(message);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -394,6 +422,7 @@ struct GuidedCaptureState {
     pitch_estimated: bool,
     quality: f32,
     message: String,
+    alert: bool,
     completed_identity: Option<FaceIdentityMatch>,
 }
 
@@ -413,6 +442,7 @@ impl GuidedCaptureState {
             pitch_estimated: false,
             quality: 0.0,
             message: "find the pose and hold still".to_owned(),
+            alert: false,
             completed_identity: None,
         }
     }
@@ -442,6 +472,7 @@ impl GuidedCaptureState {
             pitch_estimated: self.pitch_estimated,
             quality: self.quality,
             message: self.message.clone(),
+            alert: self.alert,
             completed: self.completed_identity.is_some(),
         }
     }
@@ -453,6 +484,7 @@ impl GuidedCaptureState {
         {
             if self.pose_index >= CapturePose::ALL.len() && self.completed_identity.is_none() {
                 self.message = "saving enrollment...".to_owned();
+                self.alert = false;
             }
             return None;
         }
@@ -472,33 +504,39 @@ impl GuidedCaptureState {
         let pose = CapturePose::ALL[self.pose_index];
         let Some(yaw) = yaw else {
             self.message = "yaw is unavailable".to_owned();
+            self.alert = true;
             self.stable_since = None;
             return None;
         };
         let Some(pitch) = pitch else {
             self.message = "pitch is unavailable".to_owned();
+            self.alert = true;
             self.stable_since = None;
             return None;
         };
         if self.quality < 0.65 {
             self.message = "move closer and improve lighting".to_owned();
+            self.alert = true;
             self.stable_since = None;
             return None;
         }
         if !pose_matches(pose, yaw, pitch, self.horizontal_sign, self.vertical_sign) {
             self.message =
                 pose_guidance(pose, yaw, pitch, self.horizontal_sign, self.vertical_sign);
+            self.alert = true;
             self.stable_since = None;
             return None;
         }
         let stable_since = self.stable_since.get_or_insert(now);
         if now.duration_since(*stable_since) < CAPTURE_HOLD_DURATION {
             self.message = "HOLD STILL...".to_owned();
+            self.alert = false;
             return None;
         }
         self.pending = true;
         self.stable_since = None;
         self.message = "capturing sample...".to_owned();
+        self.alert = false;
         Some(FaceCaptureRequest {
             pose,
             quality: self.quality,
@@ -529,6 +567,7 @@ impl GuidedCaptureState {
         self.pending = false;
         self.samples += 1;
         self.message = "sample accepted".to_owned();
+        self.alert = false;
         if self.samples >= CAPTURE_SAMPLES_PER_POSE {
             self.samples = 0;
             self.pose_index += 1;
@@ -540,6 +579,16 @@ impl GuidedCaptureState {
         self.pending = false;
         self.stable_since = None;
         self.message = message.to_owned();
+        self.alert = true;
+    }
+
+    fn report_problem(&mut self, message: &str) {
+        if self.completed_identity.is_some() {
+            return;
+        }
+        self.stable_since = None;
+        self.message = message.to_owned();
+        self.alert = true;
     }
 
     fn complete(&mut self, identity: FaceIdentityMatch) {
@@ -547,6 +596,7 @@ impl GuidedCaptureState {
         self.samples = CAPTURE_SAMPLES_PER_POSE;
         self.pending = false;
         self.message = format!("saved as {}", identity.display_name());
+        self.alert = false;
         self.completed_identity = Some(identity);
     }
 }
@@ -836,6 +886,79 @@ impl FaceEmbeddingEngine {
             .map_err(|error| format!("face-ID model returned an invalid tensor: {error}"))?;
         normalize_embedding(output)
     }
+}
+
+/// Benchmarks the same Core ML-backed SFace inference path used by the live camera.
+/// Input allocation and camera/alignment work are intentionally outside the timed region.
+pub fn benchmark_sface_coreml(
+    model_path: &Path,
+    cache_dir: &Path,
+    iterations: usize,
+) -> Result<SFaceBenchmarkReport, String> {
+    if iterations == 0 {
+        return Err("benchmark iterations must be greater than zero".to_owned());
+    }
+
+    let input = benchmark_input();
+    let initialization_started = Instant::now();
+    let mut engine = FaceEmbeddingEngine::new(model_path, cache_dir)?;
+    let session_initialization_ms = initialization_started.elapsed().as_secs_f64() * 1_000.0;
+
+    let first_started = Instant::now();
+    let first_embedding = engine.embed(input.clone())?;
+    let first_inference_ms = first_started.elapsed().as_secs_f64() * 1_000.0;
+
+    const WARMUP_ITERATIONS: usize = 5;
+    for _ in 0..WARMUP_ITERATIONS {
+        engine.embed(input.clone())?;
+    }
+
+    let mut samples_ms = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let sample = input.clone();
+        let started = Instant::now();
+        engine.embed(sample)?;
+        samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    samples_ms.sort_by(f64::total_cmp);
+    let average_inference_ms = samples_ms.iter().sum::<f64>() / iterations as f64;
+    let median_inference_ms = percentile(&samples_ms, 0.50);
+    let p95_inference_ms = percentile(&samples_ms, 0.95);
+
+    Ok(SFaceBenchmarkReport {
+        iterations,
+        warmup_iterations: WARMUP_ITERATIONS,
+        session_initialization_ms,
+        first_inference_ms,
+        average_inference_ms,
+        median_inference_ms,
+        p95_inference_ms,
+        minimum_inference_ms: samples_ms[0],
+        maximum_inference_ms: samples_ms[iterations - 1],
+        embeddings_per_second: 1_000.0 / average_inference_ms,
+        embedding_dimensions: first_embedding.len(),
+    })
+}
+
+fn benchmark_input() -> Vec<f32> {
+    let plane = SFACE_WIDTH * SFACE_HEIGHT;
+    let mut input = vec![0.0; plane * 3];
+    for channel in 0..3 {
+        for y in 0..SFACE_HEIGHT {
+            for x in 0..SFACE_WIDTH {
+                let offset = channel * plane + y * SFACE_WIDTH + x;
+                input[offset] = ((x * 3 + y * 5 + channel * 47) % 256) as f32;
+            }
+        }
+    }
+    input
+}
+
+fn percentile(sorted: &[f64], quantile: f64) -> f64 {
+    let index = ((sorted.len() as f64 * quantile).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    sorted[index]
 }
 
 fn run_worker(
@@ -2382,6 +2505,35 @@ mod tests {
         assert_eq!(state.samples, 1);
         assert!(state.neutral_vertical.is_some());
         assert!(state.status().pitch_estimated);
+    }
+
+    #[test]
+    fn guided_capture_problem_sets_alert_and_resets_the_hold() {
+        let face = capture_test_face(0.0, None, 0.5);
+        let mut state = GuidedCaptureState::new(FaceCaptureTarget::New {
+            name: "Test".to_owned(),
+        });
+        let started = Instant::now();
+        assert!(state.observe(&face, started).is_none());
+        assert!(state.stable_since.is_some());
+
+        state.report_problem("MULTIPLE FACES — only one person is allowed");
+
+        let status = state.status();
+        assert!(status.alert);
+        assert_eq!(
+            status.message,
+            "MULTIPLE FACES — only one person is allowed"
+        );
+        assert!(state.stable_since.is_none());
+
+        assert!(
+            state
+                .observe(&face, started + CAPTURE_HOLD_DURATION)
+                .is_none()
+        );
+        assert!(!state.status().alert);
+        assert_eq!(state.status().message, "HOLD STILL...");
     }
 
     fn capture_test_face(
