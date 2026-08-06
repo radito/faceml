@@ -1,0 +1,86 @@
+name: Apple Silicon CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-silicon-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-benchmark-package:
+    name: Test, benchmark, and package M1 binaries
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
+      CARGO_PROFILE_RELEASE_LTO: fat
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+      CARGO_PROFILE_RELEASE_PANIC: abort
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+      RUSTFLAGS: -C target-cpu=apple-m1 -C link-arg=-Wl,-dead_strip
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+
+      - name: Cache Cargo build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build fully optimized Apple Silicon binaries
+        run: cargo build --locked --release --bins
+
+      - name: Run deterministic full-pipeline benchmark
+        run: cargo run --locked --release --bin facefeature-camera -- --benchmark
+
+      - name: Assemble downloadable artifact
+        run: |
+          mkdir -p dist/facefeature-macos-arm64/bin
+          mkdir -p dist/facefeature-macos-arm64/models
+          install -m 755 target/release/facefeature dist/facefeature-macos-arm64/bin/
+          install -m 755 target/release/facefeature-camera dist/facefeature-macos-arm64/bin/
+          install -m 644 models/face_recognition_sface_2021dec.onnx dist/facefeature-macos-arm64/models/
+          install -m 644 models/SFACE-LICENSE.txt dist/facefeature-macos-arm64/models/
+          install -m 644 README.md dist/facefeature-macos-arm64/
+          cd dist/facefeature-macos-arm64
+          shasum -a 256 bin/facefeature bin/facefeature-camera models/face_recognition_sface_2021dec.onnx > SHA256SUMS
+
+      - name: Upload workflow artifact
+        id: artifact-upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: facefeature-macos-arm64-${{ github.sha }}
+          path: dist/facefeature-macos-arm64/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+      - name: Add download link to workflow summary
+        env:
+          ARTIFACT_URL: ${{ steps.artifact-upload.outputs.artifact-url }}
+        run: |
+          echo '## Download optimized Apple Silicon build' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "[Download workflow artifact]($ARTIFACT_URL)" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Built for Apple M1-class arm64 Macs. This workflow does not create a release or publish a package.' >> "$GITHUB_STEP_SUMMARY"
