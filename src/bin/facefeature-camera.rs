@@ -974,10 +974,9 @@ mod macos {
             });
         deduplicate_mesh_vertices(&mut vertices, bounds.width, bounds.height);
         add_forehead_mesh_vertices(face, &mut vertices);
-        constrain_mesh_vertices(&mut vertices, bounds);
+        apply_yaw_visibility_warp(face, &mut vertices);
         deduplicate_mesh_vertices(&mut vertices, bounds.width, bounds.height);
         interpolate_uniform_mesh(&mut vertices, bounds);
-        constrain_mesh_vertices(&mut vertices, bounds);
         deduplicate_mesh_vertices(&mut vertices, bounds.width, bounds.height);
         if vertices.len() < 3 {
             return None;
@@ -1058,22 +1057,40 @@ mod macos {
             ),
         };
 
-        let Some(upward_space) = ray_distance_to_bounds(origin, vertical, bounds) else {
-            return;
-        };
         let horizontal_projection = |point: Point| {
             (point.x - origin.x) * horizontal.x + (point.y - origin.y) * horizontal.y
         };
+        let vertical_projection =
+            |point: Point| (point.x - origin.x) * vertical.x + (point.y - origin.y) * vertical.y;
         let contour = face
             .landmarks
             .iter()
             .find(|region| region.kind == LandmarkKind::FaceContour)
             .map(|region| region.points.as_slice())
             .unwrap_or_default();
-        let (left_extent, right_extent) = contour.iter().copied().map(horizontal_projection).fold(
-            (f64::INFINITY, f64::NEG_INFINITY),
-            |(left, right), value| (left.min(value), right.max(value)),
-        );
+        let Some(upward_ray) = ray_distance_to_bounds(origin, vertical, bounds) else {
+            return;
+        };
+        let eye_to_chin = contour
+            .iter()
+            .copied()
+            .map(vertical_projection)
+            .reduce(f64::min)
+            .filter(|distance| *distance < 0.0)
+            .map(|distance| -distance)
+            .unwrap_or(bounds.height * 0.5);
+        let anatomical_forehead =
+            (eye_to_chin * 0.62).clamp(bounds.height * 0.18, bounds.height * 0.38);
+        let upward_space = upward_ray.min(anatomical_forehead);
+
+        let temple_projections = contour
+            .first()
+            .copied()
+            .zip(contour.last().copied())
+            .map(|(first, last)| [horizontal_projection(first), horizontal_projection(last)]);
+        let (left_extent, right_extent) = temple_projections
+            .map(|values| (values[0].min(values[1]), values[0].max(values[1])))
+            .unwrap_or((f64::INFINITY, f64::NEG_INFINITY));
         let (left_extent, right_extent) = if left_extent.is_finite()
             && right_extent.is_finite()
             && right_extent - left_extent > f64::EPSILON
@@ -1133,17 +1150,97 @@ mod macos {
             .reduce(f64::min)
     }
 
-    fn constrain_mesh_vertices(vertices: &mut [Point], bounds: facefeature::BoundingBox) {
-        let inset_x = bounds.width * 0.008;
-        let inset_y = bounds.height * 0.008;
-        for point in vertices {
-            point.x = point
-                .x
-                .clamp(bounds.x + inset_x, bounds.x + bounds.width - inset_x);
-            point.y = point
-                .y
-                .clamp(bounds.y + inset_y, bounds.y + bounds.height - inset_y);
+    fn apply_yaw_visibility_warp(face: &facefeature::FaceGeometry, vertices: &mut [Point]) {
+        const WARP_START_DEGREES: f64 = 18.0;
+        const WARP_FULL_DEGREES: f64 = 45.0;
+        const FRONTAL_MARGIN: f64 = 0.52;
+        const PROFILE_MARGIN: f64 = 0.16;
+
+        let Some(yaw_degrees) = face.yaw_radians.map(f64::to_degrees) else {
+            return;
+        };
+        let strength = ((yaw_degrees.abs() - WARP_START_DEGREES)
+            / (WARP_FULL_DEGREES - WARP_START_DEGREES))
+            .clamp(0.0, 1.0);
+        if strength <= f64::EPSILON {
+            return;
         }
+        let axis = yaw_visibility_axis(face);
+        if axis.len() < 2 {
+            return;
+        }
+        let margin = face.bounding_box.width
+            * (FRONTAL_MARGIN + (PROFILE_MARGIN - FRONTAL_MARGIN) * strength);
+        for vertex in vertices {
+            let center_x = interpolate_axis_x(&axis, vertex.y);
+            if yaw_degrees > 0.0 {
+                let limit = center_x + margin;
+                if vertex.x > limit {
+                    vertex.x = limit + (vertex.x - limit) * (1.0 - strength);
+                }
+            } else {
+                let limit = center_x - margin;
+                if vertex.x < limit {
+                    vertex.x = limit + (vertex.x - limit) * (1.0 - strength);
+                }
+            }
+        }
+    }
+
+    fn yaw_visibility_axis(face: &facefeature::FaceGeometry) -> Vec<Point> {
+        let bounds = face.bounding_box;
+        let eyes = landmark_center(face, LandmarkKind::LeftEye)
+            .zip(landmark_center(face, LandmarkKind::RightEye))
+            .map(|(left, right)| Point {
+                x: (left.x + right.x) * 0.5,
+                y: (left.y + right.y) * 0.5,
+            });
+        let nose = landmark_center(face, LandmarkKind::Nose)
+            .or_else(|| landmark_center(face, LandmarkKind::NoseCrest));
+        let mouth = landmark_center(face, LandmarkKind::OuterLips);
+        let chin = face
+            .landmarks
+            .iter()
+            .find(|region| region.kind == LandmarkKind::FaceContour)
+            .and_then(|region| {
+                region
+                    .points
+                    .iter()
+                    .copied()
+                    .min_by(|left, right| left.y.total_cmp(&right.y))
+            });
+        let top_x = eyes
+            .or(nose)
+            .map(|point| point.x)
+            .unwrap_or(bounds.x + bounds.width * 0.5);
+        let mut axis = vec![Point {
+            x: top_x,
+            y: bounds.y + bounds.height,
+        }];
+        axis.extend([eyes, nose, mouth, chin].into_iter().flatten());
+        axis.sort_by(|left, right| left.y.total_cmp(&right.y));
+        axis.dedup_by(|left, right| (left.y - right.y).abs() < 1e-8);
+        axis
+    }
+
+    fn interpolate_axis_x(axis: &[Point], y: f64) -> f64 {
+        if y <= axis[0].y {
+            return axis[0].x;
+        }
+        if y >= axis[axis.len() - 1].y {
+            return axis[axis.len() - 1].x;
+        }
+        axis.windows(2)
+            .find_map(|segment| {
+                let [lower, upper] = segment else {
+                    return None;
+                };
+                (y >= lower.y && y <= upper.y).then(|| {
+                    let progress = (y - lower.y) / (upper.y - lower.y);
+                    lower.x + (upper.x - lower.x) * progress
+                })
+            })
+            .unwrap_or(axis[axis.len() - 1].x)
     }
 
     fn interpolate_uniform_mesh(vertices: &mut Vec<Point>, bounds: facefeature::BoundingBox) {
@@ -1192,7 +1289,6 @@ mod macos {
                 })
                 .collect::<Vec<_>>();
             vertices.extend(interpolated);
-            constrain_mesh_vertices(vertices, bounds);
             deduplicate_mesh_vertices(vertices, bounds.width, bounds.height);
         }
     }
@@ -1831,7 +1927,9 @@ mod macos {
                         Point { x: 0.27, y: 0.24 },
                         Point { x: 0.45, y: 0.13 },
                         Point { x: 0.63, y: 0.24 },
-                        Point { x: 0.67, y: 0.55 },
+                        // Rotated/smoothed landmark geometry can legitimately extend beyond the
+                        // current axis-aligned box (whose right edge is 0.70).
+                        Point { x: 0.72, y: 0.55 },
                     ],
                 },
                 facefeature::LandmarkRegion {
@@ -1871,16 +1969,15 @@ mod macos {
                     .iter()
                     .all(|triangle| triangle.iter().all(|index| *index < mesh.vertices.len()))
             );
-            assert!(mesh.vertices.iter().all(|point| {
-                point.x >= bounds.x
-                    && point.x <= bounds.x + bounds.width
-                    && point.y >= bounds.y
-                    && point.y <= bounds.y + bounds.height
-            }));
             assert!(
                 mesh.vertices
                     .iter()
-                    .all(|point| (0.23..=0.67).contains(&point.x))
+                    .all(|point| (0.23..=0.72).contains(&point.x))
+            );
+            assert!(
+                mesh.vertices
+                    .iter()
+                    .any(|point| point.x > bounds.x + bounds.width)
             );
             let longest_edge = mesh
                 .triangles
@@ -1917,6 +2014,127 @@ mod macos {
                 Point { x: 0.0, y: 1.0 },
             ]);
             assert_eq!(triangles.len(), 2);
+        }
+
+        #[test]
+        fn strong_yaw_warps_only_the_self_occluded_mesh_side() {
+            let bounds = facefeature::BoundingBox {
+                x: 0.2,
+                y: 0.1,
+                width: 0.5,
+                height: 0.7,
+            };
+            let landmarks = vec![
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::FaceContour,
+                    points: vec![Point { x: 0.23, y: 0.55 }, Point { x: 0.45, y: 0.13 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::LeftEye,
+                    points: vec![Point { x: 0.35, y: 0.65 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::RightEye,
+                    points: vec![Point { x: 0.55, y: 0.65 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::Nose,
+                    points: vec![Point { x: 0.45, y: 0.45 }],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::OuterLips,
+                    points: vec![Point { x: 0.45, y: 0.30 }],
+                },
+            ];
+            let face = facefeature::FaceGeometry {
+                confidence: 0.99,
+                landmark_confidence: 0.99,
+                bounding_box: bounds,
+                roll_radians: None,
+                yaw_radians: Some(45.0_f64.to_radians()),
+                pitch_radians: None,
+                measurements: facefeature::FaceGeometry::calculate_measurements(bounds, &landmarks),
+                landmarks,
+            };
+            let mut vertices = vec![Point { x: 0.67, y: 0.55 }, Point { x: 0.23, y: 0.55 }];
+            apply_yaw_visibility_warp(&face, &mut vertices);
+            assert!(vertices[0].x <= 0.531);
+            assert!((vertices[1].x - 0.23).abs() < 1e-12);
+
+            let mut opposite_face = face;
+            opposite_face.yaw_radians = Some((-45.0_f64).to_radians());
+            let mut opposite_vertices =
+                vec![Point { x: 0.67, y: 0.55 }, Point { x: 0.23, y: 0.55 }];
+            apply_yaw_visibility_warp(&opposite_face, &mut opposite_vertices);
+            assert!((opposite_vertices[0].x - 0.67).abs() < 1e-12);
+            assert!(opposite_vertices[1].x >= 0.369);
+        }
+
+        #[test]
+        fn rolled_forehead_uses_temples_instead_of_wide_jaw_points() {
+            let bounds = facefeature::BoundingBox {
+                x: 0.2,
+                y: 0.1,
+                width: 0.6,
+                height: 0.8,
+            };
+            let angle = 30.0_f64.to_radians();
+            let horizontal = Point {
+                x: angle.cos(),
+                y: angle.sin(),
+            };
+            let vertical = Point {
+                x: -angle.sin(),
+                y: angle.cos(),
+            };
+            let origin = Point { x: 0.5, y: 0.57 };
+            let offset = |across: f64, down: f64| Point {
+                x: origin.x + horizontal.x * across - vertical.x * down,
+                y: origin.y + horizontal.y * across - vertical.y * down,
+            };
+            let landmarks = vec![
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::FaceContour,
+                    points: vec![
+                        offset(-0.16, 0.0),
+                        offset(-0.28, 0.24),
+                        offset(0.0, 0.40),
+                        offset(0.28, 0.24),
+                        offset(0.16, 0.0),
+                    ],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::LeftEye,
+                    points: vec![offset(-0.08, 0.0)],
+                },
+                facefeature::LandmarkRegion {
+                    kind: LandmarkKind::RightEye,
+                    points: vec![offset(0.08, 0.0)],
+                },
+            ];
+            let face = facefeature::FaceGeometry {
+                confidence: 0.99,
+                landmark_confidence: 0.99,
+                bounding_box: bounds,
+                roll_radians: Some(angle),
+                yaw_radians: Some(0.0),
+                pitch_radians: None,
+                measurements: facefeature::FaceGeometry::calculate_measurements(bounds, &landmarks),
+                landmarks,
+            };
+            let mut forehead = Vec::new();
+            add_forehead_mesh_vertices(&face, &mut forehead);
+            assert!(!forehead.is_empty());
+            assert!(forehead.iter().all(|point| {
+                let projection =
+                    (point.x - origin.x) * horizontal.x + (point.y - origin.y) * horizontal.y;
+                (-0.161..=0.161).contains(&projection)
+            }));
+            let maximum_height = forehead
+                .iter()
+                .map(|point| (point.x - origin.x) * vertical.x + (point.y - origin.y) * vertical.y)
+                .fold(0.0_f64, f64::max);
+            assert!(maximum_height <= 0.40 * 0.62 + 1e-12);
         }
 
         fn landmarks_point_count(face: &facefeature::FaceGeometry) -> usize {

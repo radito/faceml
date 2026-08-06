@@ -48,12 +48,17 @@ cargo run --release --bin facefeature-camera -- --face-mask polygon
 ```
 
 Several roll-aware synthetic forehead rows close the region that Apple Vision does not directly
-landmark, while the eyes and inner mouth remain open. Shared edge midpoints are interpolated along
+landmark. Their width uses the contour's temple endpoints rather than roll-sensitive jaw extrema,
+and their height is capped from measured eye-to-chin distance. The eyes and inner mouth remain
+open. Shared edge midpoints are interpolated along
 every oversized edge before repeated Delaunay triangulation, producing a consistent face-relative
 triangle size across the forehead, cheeks, nose, and mouth while retaining the original Vision
 landmark outlines. The polygon mask is rendered with a lightweight Core Animation shape layer. It
 does not require face recognition and can be combined with `--face-id`, `--read-only`, or
-`--capture`.
+`--capture`. At strong yaw, the generated mesh progressively warps its self-occluded side toward a
+forehead/eye/nose/mouth/chin visibility axis so Vision's inferred hidden landmarks do not form a
+wireframe wing over the background. The mesh is not clipped to the axis-aligned detection box,
+because valid rotated contour points can extend beyond that rectangle at strong roll.
 
 ### Optional face identity
 
