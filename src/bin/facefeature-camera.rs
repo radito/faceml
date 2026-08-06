@@ -5,6 +5,7 @@ mod macos {
     use std::env;
     use std::path::PathBuf;
     use std::process::Command;
+    use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ mod macos {
     use facefeature::detector::apple_vision::AppleVisionDetector;
     use facefeature::face_id::{
         FaceCaptureStatus, FaceCaptureTarget, FaceIdClient, FaceIdDatabaseMode, FaceIdentityMatch,
-        aligned_sface_tensor_bgra, benchmark_sface_coreml, landmark_pitch_degrees,
+        SFacePipelineBenchmarkEngine, aligned_sface_tensor_bgra, landmark_pitch_degrees,
     };
     use facefeature::{FaceTracker, LandmarkKind, Point, TrackedFace};
     use objc2::rc::Retained;
@@ -34,10 +35,10 @@ mod macos {
     use objc2_core_graphics::{CGColor, CGMutablePath};
     use objc2_core_media::CMSampleBuffer;
     use objc2_core_video::{
-        CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
-        CVPixelBufferGetHeight, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
-        CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelBufferPixelFormatTypeKey,
-        kCVPixelFormatType_32BGRA, kCVReturnSuccess,
+        CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress,
+        CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
+        CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+        kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_32BGRA, kCVReturnSuccess,
     };
     use objc2_foundation::{
         MainThreadMarker, NSDictionary, NSNotification, NSNumber, NSObject, NSObjectProtocol,
@@ -53,6 +54,13 @@ mod macos {
     const LABEL_INTERVAL: Duration = Duration::from_millis(200);
     const PRESENTATION_DELAY_SECONDS: f64 = 1.0 / 60.0;
     const DEPTH_LAYER_COUNT: usize = 8;
+    const BENCHMARK_FIXTURE_WIDTH: usize = 160;
+    const BENCHMARK_FIXTURE_HEIGHT: usize = 90;
+    const BENCHMARK_FIXTURE_BGRA: &[u8; BENCHMARK_FIXTURE_WIDTH * BENCHMARK_FIXTURE_HEIGHT * 4] =
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/benchmark_face_fixture.bgra"
+        ));
 
     #[derive(Debug)]
     struct FrameDelegateIvars {
@@ -1041,6 +1049,54 @@ mod macos {
         }
     }
 
+    fn benchmark_depth_mesh_and_paths(face: &facefeature::FaceGeometry) -> (usize, usize, usize) {
+        let Some(mesh) = polygon_face_mesh(face) else {
+            return (0, 0, 0);
+        };
+        let depths = mesh
+            .vertices
+            .iter()
+            .map(|point| pseudo_face_depth(face, *point))
+            .collect::<Vec<_>>();
+        let mut edge_brightness = BTreeMap::<(usize, usize), (f64, usize)>::new();
+        for triangle in &mesh.triangles {
+            let brightness = triangle_surface_brightness(face, &mesh, &depths, *triangle);
+            for (left, right) in [
+                (triangle[0], triangle[1]),
+                (triangle[1], triangle[2]),
+                (triangle[2], triangle[0]),
+            ] {
+                let edge = if left < right {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                let accumulated = edge_brightness.entry(edge).or_insert((0.0, 0));
+                accumulated.0 += brightness;
+                accumulated.1 += 1;
+            }
+        }
+        let paths = (0..DEPTH_LAYER_COUNT)
+            .map(|_| CGMutablePath::new())
+            .collect::<Vec<_>>();
+        for ((left, right), (brightness_sum, triangle_count)) in &edge_brightness {
+            let brightness = brightness_sum / *triangle_count as f64;
+            let path = &paths[shade_band(brightness, paths.len())];
+            let first = mesh.vertices[*left];
+            let second = mesh.vertices[*right];
+            unsafe {
+                CGMutablePath::move_to_point(Some(path), std::ptr::null(), first.x, first.y);
+                CGMutablePath::add_line_to_point(Some(path), std::ptr::null(), second.x, second.y);
+            }
+        }
+        std::hint::black_box(&paths);
+        (
+            mesh.vertices.len(),
+            mesh.triangles.len(),
+            edge_brightness.len(),
+        )
+    }
+
     fn triangle_surface_brightness(
         face: &facefeature::FaceGeometry,
         mesh: &PolygonFaceMesh,
@@ -1949,7 +2005,7 @@ mod macos {
 
     fn print_help() {
         println!(
-            "facefeature-camera\n\nUSAGE:\n    facefeature-camera [OPTIONS]\n    facefeature-camera --face-id [OPTIONS]\n    facefeature-camera --read-only [OPTIONS]\n    facefeature-camera --capture (--name NAME | --person ID) [OPTIONS]\n    facefeature-camera --benchmark [OPTIONS]\n\nOPTIONS:\n    --face-id                 Automatic matching and enrollment\n    --read-only               Match from SQLite without inserting or updating rows\n    --capture                 Guided center/left/right/up/down enrollment\n    --name NAME               Create a new named identity during guided capture\n    --person ID               Replace/add guided samples for an existing identity\n    --face-mask MODE          Face overlay: polygon, depth, or none (default)\n    --mask-only               Hide the camera image; retain generated overlays\n    --benchmark               Benchmark headless SFace/Core ML inference\n    --benchmark-iterations N  Timed iterations (default: 100)\n    --face-id-model PATH      Use a custom SFace ONNX model\n    --face-id-db PATH         Use a custom SQLite identity gallery path\n    -h, --help                Print this help"
+            "facefeature-camera\n\nUSAGE:\n    facefeature-camera [OPTIONS]\n    facefeature-camera --face-id [OPTIONS]\n    facefeature-camera --read-only [OPTIONS]\n    facefeature-camera --capture (--name NAME | --person ID) [OPTIONS]\n    facefeature-camera --benchmark [OPTIONS]\n\nOPTIONS:\n    --face-id                 Automatic matching and enrollment\n    --read-only               Match from SQLite without inserting or updating rows\n    --capture                 Guided center/left/right/up/down enrollment\n    --name NAME               Create a new named identity during guided capture\n    --person ID               Replace/add guided samples for an existing identity\n    --face-mask MODE          Face overlay: polygon, depth, or none (default)\n    --mask-only               Hide the camera image; retain generated overlays\n    --benchmark               Benchmark the deterministic headless full pipeline\n    --benchmark-iterations N  Timed iterations (default: 100)\n    --face-id-model PATH      Use a custom SFace ONNX model\n    --face-id-db PATH         Use a custom SQLite identity gallery path\n    -h, --help                Print this help"
         );
     }
 
@@ -1987,43 +2043,393 @@ mod macos {
         (format!("{model} | {chip} | {architecture}"), memory)
     }
 
+    #[derive(Debug)]
+    struct BenchmarkStageStats {
+        average_ms: f64,
+        median_ms: f64,
+        p95_ms: f64,
+        minimum_ms: f64,
+        maximum_ms: f64,
+    }
+
+    fn summarize_stage(samples: &[f64]) -> BenchmarkStageStats {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let percentile = |quantile: f64| {
+            let index = ((sorted.len() as f64 * quantile).ceil() as usize)
+                .saturating_sub(1)
+                .min(sorted.len() - 1);
+            sorted[index]
+        };
+        BenchmarkStageStats {
+            average_ms: sorted.iter().sum::<f64>() / sorted.len() as f64,
+            median_ms: percentile(0.50),
+            p95_ms: percentile(0.95),
+            minimum_ms: sorted[0],
+            maximum_ms: sorted[sorted.len() - 1],
+        }
+    }
+
+    fn print_stage(name: &str, samples: &[f64]) {
+        let stats = summarize_stage(samples);
+        println!(
+            "  {name:<24} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            stats.average_ms, stats.median_ms, stats.p95_ms, stats.minimum_ms, stats.maximum_ms,
+        );
+    }
+
+    fn elapsed_ms(started: Instant) -> f64 {
+        started.elapsed().as_secs_f64() * 1_000.0
+    }
+
+    fn benchmark_pixel_buffer() -> Result<CFRetained<CVPixelBuffer>, String> {
+        const WIDTH: usize = 1280;
+        const HEIGHT: usize = 720;
+        let mut raw = std::ptr::null_mut::<CVPixelBuffer>();
+        let status = unsafe {
+            CVPixelBufferCreate(
+                None,
+                WIDTH,
+                HEIGHT,
+                kCVPixelFormatType_32BGRA,
+                None,
+                NonNull::from(&mut raw),
+            )
+        };
+        if status != kCVReturnSuccess {
+            return Err(format!(
+                "could not create synthetic benchmark pixel buffer: {status}"
+            ));
+        }
+        let raw = NonNull::new(raw).ok_or("Core Video returned a null benchmark buffer")?;
+        let buffer = unsafe { CFRetained::from_raw(raw) };
+        let flags = CVPixelBufferLockFlags::empty();
+        let lock_status = unsafe { CVPixelBufferLockBaseAddress(&buffer, flags) };
+        if lock_status != kCVReturnSuccess {
+            return Err(format!(
+                "could not lock synthetic benchmark pixels: {lock_status}"
+            ));
+        }
+        let bytes_per_row = CVPixelBufferGetBytesPerRow(&buffer);
+        let base = CVPixelBufferGetBaseAddress(&buffer).cast::<u8>();
+        if base.is_null() {
+            let _ = unsafe { CVPixelBufferUnlockBaseAddress(&buffer, flags) };
+            return Err("synthetic benchmark pixel buffer has no storage".to_owned());
+        }
+        let pixels = unsafe { std::slice::from_raw_parts_mut(base, bytes_per_row * HEIGHT) };
+        upscale_benchmark_fixture(pixels, bytes_per_row, WIDTH, HEIGHT);
+        let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(&buffer, flags) };
+        if unlock_status != kCVReturnSuccess {
+            return Err(format!(
+                "could not unlock synthetic benchmark pixels: {unlock_status}"
+            ));
+        }
+        Ok(buffer)
+    }
+
+    fn upscale_benchmark_fixture(
+        pixels: &mut [u8],
+        bytes_per_row: usize,
+        width: usize,
+        height: usize,
+    ) {
+        let x_scale = (BENCHMARK_FIXTURE_WIDTH - 1) as f32 / (width - 1) as f32;
+        let y_scale = (BENCHMARK_FIXTURE_HEIGHT - 1) as f32 / (height - 1) as f32;
+        for y in 0..height {
+            let source_y = y as f32 * y_scale;
+            let y0 = source_y.floor() as usize;
+            let y1 = (y0 + 1).min(BENCHMARK_FIXTURE_HEIGHT - 1);
+            let fy = source_y - y0 as f32;
+            for x in 0..width {
+                let source_x = x as f32 * x_scale;
+                let x0 = source_x.floor() as usize;
+                let x1 = (x0 + 1).min(BENCHMARK_FIXTURE_WIDTH - 1);
+                let fx = source_x - x0 as f32;
+                let destination = y * bytes_per_row + x * 4;
+                let source_00 = (y0 * BENCHMARK_FIXTURE_WIDTH + x0) * 4;
+                let source_10 = (y0 * BENCHMARK_FIXTURE_WIDTH + x1) * 4;
+                let source_01 = (y1 * BENCHMARK_FIXTURE_WIDTH + x0) * 4;
+                let source_11 = (y1 * BENCHMARK_FIXTURE_WIDTH + x1) * 4;
+                for channel in 0..4 {
+                    let top = BENCHMARK_FIXTURE_BGRA[source_00 + channel] as f32 * (1.0 - fx)
+                        + BENCHMARK_FIXTURE_BGRA[source_10 + channel] as f32 * fx;
+                    let bottom = BENCHMARK_FIXTURE_BGRA[source_01 + channel] as f32 * (1.0 - fx)
+                        + BENCHMARK_FIXTURE_BGRA[source_11 + channel] as f32 * fx;
+                    pixels[destination + channel] = (top * (1.0 - fy) + bottom * fy).round() as u8;
+                }
+            }
+        }
+    }
+
+    fn benchmark_face_geometry() -> facefeature::FaceGeometry {
+        let bounds = facefeature::BoundingBox {
+            x: 0.32,
+            y: 0.11,
+            width: 0.36,
+            height: 0.78,
+        };
+        let center = Point { x: 0.5, y: 0.5 };
+        let mut all_points = Vec::new();
+        for row in 0..11 {
+            let y = -0.88 + row as f64 * 0.176;
+            for column in 0..11 {
+                let x = -0.90 + column as f64 * 0.18;
+                if x * x + y * y <= 1.0 {
+                    all_points.push(Point {
+                        x: center.x + x * bounds.width * 0.47,
+                        y: center.y + y * bounds.height * 0.47,
+                    });
+                }
+            }
+        }
+        let ellipse = |center: Point, radius_x: f64, radius_y: f64, count: usize| {
+            (0..count)
+                .map(|index| {
+                    let angle = std::f64::consts::TAU * index as f64 / count as f64;
+                    Point {
+                        x: center.x + angle.cos() * radius_x,
+                        y: center.y + angle.sin() * radius_y,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let contour = (0..=16)
+            .map(|index| {
+                let angle = std::f64::consts::PI + std::f64::consts::PI * index as f64 / 16.0;
+                Point {
+                    x: center.x + angle.cos() * bounds.width * 0.47,
+                    y: 0.61 + angle.sin() * bounds.height * 0.55,
+                }
+            })
+            .collect::<Vec<_>>();
+        let left_eye_center = Point { x: 0.435, y: 0.60 };
+        let right_eye_center = Point { x: 0.565, y: 0.60 };
+        let mouth_center = Point { x: 0.50, y: 0.37 };
+        let landmarks = vec![
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::AllPoints,
+                points: all_points,
+            },
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::FaceContour,
+                points: contour,
+            },
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::LeftEye,
+                points: ellipse(left_eye_center, 0.040, 0.018, 8),
+            },
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::RightEye,
+                points: ellipse(right_eye_center, 0.040, 0.018, 8),
+            },
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::LeftEyebrow,
+                points: vec![Point { x: 0.395, y: 0.655 }, Point { x: 0.475, y: 0.665 }],
+            },
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::RightEyebrow,
+                points: vec![Point { x: 0.525, y: 0.665 }, Point { x: 0.605, y: 0.655 }],
+            },
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::Nose,
+                points: vec![
+                    Point { x: 0.48, y: 0.48 },
+                    Point { x: 0.50, y: 0.55 },
+                    Point { x: 0.52, y: 0.48 },
+                    Point { x: 0.50, y: 0.45 },
+                ],
+            },
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::NoseCrest,
+                points: vec![Point { x: 0.50, y: 0.58 }, Point { x: 0.50, y: 0.47 }],
+            },
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::OuterLips,
+                points: ellipse(mouth_center, 0.068, 0.030, 10),
+            },
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::InnerLips,
+                points: ellipse(mouth_center, 0.040, 0.012, 8),
+            },
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::LeftPupil,
+                points: vec![left_eye_center],
+            },
+            facefeature::LandmarkRegion {
+                kind: LandmarkKind::RightPupil,
+                points: vec![right_eye_center],
+            },
+        ];
+        facefeature::FaceGeometry {
+            confidence: 0.99,
+            landmark_confidence: 0.99,
+            bounding_box: bounds,
+            roll_radians: Some(0.0),
+            yaw_radians: Some(0.0),
+            pitch_radians: Some(0.0),
+            measurements: facefeature::FaceGeometry::calculate_measurements(bounds, &landmarks),
+            landmarks,
+        }
+    }
+
+    fn benchmark_aligned_tensor(
+        pixel_buffer: &CVPixelBuffer,
+        face: &facefeature::FaceGeometry,
+    ) -> Result<Vec<f32>, String> {
+        let flags = CVPixelBufferLockFlags::ReadOnly;
+        let lock_status = unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, flags) };
+        if lock_status != kCVReturnSuccess {
+            return Err(format!("could not lock benchmark pixels: {lock_status}"));
+        }
+        let width = CVPixelBufferGetWidth(pixel_buffer);
+        let height = CVPixelBufferGetHeight(pixel_buffer);
+        let bytes_per_row = CVPixelBufferGetBytesPerRow(pixel_buffer);
+        let base = CVPixelBufferGetBaseAddress(pixel_buffer).cast::<u8>();
+        let result = if base.is_null() {
+            Err("benchmark pixel buffer has no storage".to_owned())
+        } else {
+            let pixels = unsafe { std::slice::from_raw_parts(base, bytes_per_row * height) };
+            aligned_sface_tensor_bgra(pixels, width, height, bytes_per_row, face)
+        };
+        let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(pixel_buffer, flags) };
+        if unlock_status != kCVReturnSuccess {
+            return Err(format!(
+                "could not unlock benchmark pixels: {unlock_status}"
+            ));
+        }
+        result
+    }
+
     fn run_benchmark(model_path: &std::path::Path, iterations: usize) -> Result<(), String> {
         let (hardware, memory) = hardware_summary();
         let macos = system_value("/usr/bin/sw_vers", &["-productVersion"]);
         let cache_dir = PathBuf::from("target/face-id-coreml-cache");
-        println!("SFace/Core ML benchmark");
+        println!("FaceFeature deterministic full-pipeline benchmark");
         println!("hardware: {hardware} | memory: {memory} | macOS: {macos}");
         println!("model: {}", model_path.display());
-        println!("backend: CoreML | compute units: all | input: 1x3x112x112");
-        let report = benchmark_sface_coreml(model_path, &cache_dir, iterations)?;
+        println!(
+            "input: embedded synthetic face 160x90 -> in-memory BGRA 1280x720 | no camera | no database writes"
+        );
+        println!("Vision: detected face geometry feeds every downstream stage");
+        println!(
+            "matching: {} deterministic in-memory templates",
+            SFacePipelineBenchmarkEngine::GALLERY_IDENTITIES
+        );
+
+        let pixel_buffer = benchmark_pixel_buffer()?;
+        let face = benchmark_face_geometry();
+        let initialization_started = Instant::now();
+        let mut engine = SFacePipelineBenchmarkEngine::new(model_path, &cache_dir)?;
+        let session_initialization_ms = elapsed_ms(initialization_started);
+        let mut tracker = FaceTracker::default();
+        const WARMUPS: usize = 5;
+        let mut vision_ms = Vec::with_capacity(iterations);
+        let mut tracking_ms = Vec::with_capacity(iterations);
+        let mut mesh_ms = Vec::with_capacity(iterations);
+        let mut alignment_ms = Vec::with_capacity(iterations);
+        let mut embedding_ms = Vec::with_capacity(iterations);
+        let mut matching_ms = Vec::with_capacity(iterations);
+        let mut total_ms = Vec::with_capacity(iterations);
+        let mut detected_faces = 0_usize;
+        let mut fallback_frames = 0_usize;
+        let mut vertices = 0_usize;
+        let mut triangles = 0_usize;
+        let mut edges = 0_usize;
+        let mut embedding_dimensions = 0_usize;
+
+        for iteration in 0..(iterations + WARMUPS) {
+            let total_started = Instant::now();
+            let vision_started = Instant::now();
+            let detection = AppleVisionDetector
+                .detect_pixel_buffer(&pixel_buffer)
+                .map_err(|error| format!("Vision benchmark failed: {error}"))?;
+            let current_vision_ms = elapsed_ms(vision_started);
+
+            let tracking_started = Instant::now();
+            let downstream_faces = if detection.faces.is_empty() {
+                vec![face.clone()]
+            } else {
+                detection.faces.clone()
+            };
+            let used_fallback = detection.faces.is_empty();
+            let tracked = tracker.update_at(downstream_faces, Instant::now());
+            let current_tracking_ms = elapsed_ms(tracking_started);
+            let tracked_face = tracked
+                .first()
+                .ok_or("synthetic benchmark tracker returned no face")?;
+
+            let mesh_started = Instant::now();
+            let (current_vertices, current_triangles, current_edges) =
+                benchmark_depth_mesh_and_paths(&tracked_face.geometry);
+            let current_mesh_ms = elapsed_ms(mesh_started);
+
+            let alignment_started = Instant::now();
+            let tensor = benchmark_aligned_tensor(&pixel_buffer, &tracked_face.geometry)?;
+            let current_alignment_ms = elapsed_ms(alignment_started);
+
+            let embedding_started = Instant::now();
+            let embedding = engine.embed(tensor)?;
+            let current_embedding_ms = elapsed_ms(embedding_started);
+
+            let matching_started = Instant::now();
+            std::hint::black_box(engine.match_embedding(&embedding));
+            let current_matching_ms = elapsed_ms(matching_started);
+            let current_total_ms = elapsed_ms(total_started);
+
+            if iteration < WARMUPS {
+                continue;
+            }
+            detected_faces += detection.faces.len();
+            fallback_frames += usize::from(used_fallback);
+            vertices += current_vertices;
+            triangles += current_triangles;
+            edges += current_edges;
+            embedding_dimensions = embedding.len();
+            vision_ms.push(current_vision_ms);
+            tracking_ms.push(current_tracking_ms);
+            mesh_ms.push(current_mesh_ms);
+            alignment_ms.push(current_alignment_ms);
+            embedding_ms.push(current_embedding_ms);
+            matching_ms.push(current_matching_ms);
+            total_ms.push(current_total_ms);
+        }
+
         println!(
             "session initialization: {:.3} ms",
-            report.session_initialization_ms
+            session_initialization_ms
         );
-        println!("first inference:       {:.3} ms", report.first_inference_ms);
+        println!("steady state ({iterations} runs after {WARMUPS} warmups):");
         println!(
-            "steady state ({} runs after {} warmups):",
-            report.iterations, report.warmup_iterations
+            "  {:<24} {:>8} {:>8} {:>8} {:>8} {:>8}",
+            "stage", "avg", "p50", "p95", "min", "max"
+        );
+        print_stage("Vision face request", &vision_ms);
+        print_stage("tracking", &tracking_ms);
+        print_stage("mesh + depth + CGPath", &mesh_ms);
+        print_stage("SFace alignment", &alignment_ms);
+        print_stage("SFace/CoreML embedding", &embedding_ms);
+        print_stage("gallery cosine match", &matching_ms);
+        print_stage("total sequential", &total_ms);
+        let total = summarize_stage(&total_ms);
+        println!(
+            "throughput: {:.1} complete synthetic frames/s",
+            1_000.0 / total.average_ms
         );
         println!(
-            "  average:             {:.3} ms",
-            report.average_inference_ms
+            "geometry: {:.0} vertices | {:.0} triangles | {:.0} unique edges",
+            vertices as f64 / iterations as f64,
+            triangles as f64 / iterations as f64,
+            edges as f64 / iterations as f64,
         );
         println!(
-            "  median (p50):        {:.3} ms",
-            report.median_inference_ms
-        );
-        println!("  p95:                 {:.3} ms", report.p95_inference_ms);
-        println!(
-            "  min / max:           {:.3} / {:.3} ms",
-            report.minimum_inference_ms, report.maximum_inference_ms
+            "embedding: {embedding_dimensions} dimensions | gallery: {} templates",
+            engine.gallery_size()
         );
         println!(
-            "  throughput:          {:.1} embeddings/s",
-            report.embeddings_per_second
+            "Vision detections: {:.2} faces/request | fallback geometry: {:.1}% of runs",
+            detected_faces as f64 / iterations as f64,
+            fallback_frames as f64 * 100.0 / iterations as f64
         );
-        println!("embedding dimensions:  {}", report.embedding_dimensions);
-        println!("note: synthetic input; this measures embedding compute, not camera or Vision");
         Ok(())
     }
 
@@ -2210,6 +2616,32 @@ mod macos {
                 parse_options(["--benchmark-iterations".to_owned(), "17".to_owned()]).unwrap();
             assert_eq!(options.benchmark_iterations, Some(17));
             assert!(options.face_id_model.is_some());
+        }
+
+        #[test]
+        fn deterministic_benchmark_fixture_exercises_downstream_stages() {
+            let pixel_buffer = benchmark_pixel_buffer().unwrap();
+            let detection = AppleVisionDetector
+                .detect_pixel_buffer(&pixel_buffer)
+                .unwrap();
+            assert_eq!(detection.faces.len(), 1);
+            let face = &detection.faces[0];
+            let tensor = benchmark_aligned_tensor(&pixel_buffer, face).unwrap();
+            assert_eq!(tensor.len(), 3 * 112 * 112);
+            let (vertices, triangles, edges) = benchmark_depth_mesh_and_paths(face);
+            assert!(vertices > 100);
+            assert!(triangles > 100);
+            assert!(edges > triangles);
+        }
+
+        #[test]
+        fn benchmark_stage_summary_reports_sorted_percentiles() {
+            let summary = summarize_stage(&[5.0, 1.0, 3.0, 2.0, 4.0]);
+            assert_eq!(summary.average_ms, 3.0);
+            assert_eq!(summary.median_ms, 3.0);
+            assert_eq!(summary.p95_ms, 5.0);
+            assert_eq!(summary.minimum_ms, 1.0);
+            assert_eq!(summary.maximum_ms, 5.0);
         }
 
         #[test]

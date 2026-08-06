@@ -176,34 +176,51 @@ Vision's native coordinate system.
 
 ## Benchmark
 
-Benchmark the actual headless SFace/Core ML path on the current Mac without opening the camera:
+Benchmark the deterministic headless compute pipeline without opening or requesting access to the
+camera:
 
 ```sh
 cargo run --release --bin facefeature-camera -- --benchmark
 ```
 
-The report separates Core ML session initialization, the first inference, and steady-state average,
-median, p95, min/max, and throughput. Change the timed sample count with
-`--benchmark-iterations N`. This uses a deterministic synthetic 112x112 input, so it measures the
-embedding stage rather than AVFoundation capture, Apple Vision detection, alignment, or rendering.
+The benchmark compiles a fictional synthetic face fixture into the binary as a 160x90 BGRA pixel
+array, bilinearly upscales it into an in-memory 1280x720 Core Video buffer, and sends that buffer to
+Apple Vision. Vision's detected face and landmarks feed tracking and every downstream stage. It
+measures the Vision request, tracking, dense mesh/depth/CGPath construction, SFace alignment, Core
+ML embedding, a 256-template in-memory cosine gallery scan, and total sequential latency. It never
+opens the webcam or reads/writes the identity database. SQLite is not timed because live matching
+loads its templates into memory at startup rather than querying SQLite for every frame.
+
+The fixture is stored only as compiled raw pixels in `assets/benchmark_face_fixture.bgra`; no
+directly viewable image asset is included. The report includes the detected-face count and fallback
+rate. The fixed geometry fallback prevents a benchmark failure if a future Vision revision rejects
+the fixture, but a nonzero fallback rate means the Vision-positive result is no longer
+representative. Change the sample count with `--benchmark-iterations N`.
 
 Tested on an 8 GB Apple M1 MacBook Air using the release build (100 measured runs after five
 warmups):
 
 ```text
-SFace/Core ML benchmark
+FaceFeature deterministic full-pipeline benchmark
 hardware: MacBook Air | Apple M1 | arm64 | memory: 8 GB | macOS: 27.0
 model: models/face_recognition_sface_2021dec.onnx
-backend: CoreML | compute units: all | input: 1x3x112x112
-session initialization: 42.972 ms
-first inference:       8.357 ms
+input: embedded synthetic face 160x90 -> in-memory BGRA 1280x720 | no camera | no database writes
+Vision: detected face geometry feeds every downstream stage
+matching: 256 deterministic in-memory templates
+session initialization: 47.269 ms
 steady state (100 runs after 5 warmups):
-  average:             7.956 ms
-  median (p50):        7.891 ms
-  p95:                 8.383 ms
-  min / max:           6.874 / 8.767 ms
-  throughput:          125.7 embeddings/s
-embedding dimensions:  128
+  stage                         avg      p50      p95      min      max
+  Vision face request         7.517    7.451    8.180    6.836    9.452
+  tracking                    0.006    0.006    0.009    0.005    0.020
+  mesh + depth + CGPath       4.295    4.218    4.783    4.020    5.969
+  SFace alignment             0.141    0.137    0.182    0.114    0.261
+  SFace/CoreML embedding      8.242    8.054    9.497    7.423   10.879
+  gallery cosine match        0.016    0.016    0.017    0.015    0.020
+  total sequential           20.219   19.826   22.919   18.970   25.055
+throughput: 49.5 complete synthetic frames/s
+geometry: 433 vertices | 791 triangles | 1225 unique edges
+embedding: 128 dimensions | gallery: 256 templates
+Vision detections: 1.00 faces/request | fallback geometry: 0.0% of runs
 ```
 
 These are representative results from one run; temperature, power mode, background load, Core ML

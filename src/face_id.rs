@@ -888,6 +888,50 @@ impl FaceEmbeddingEngine {
     }
 }
 
+/// Synchronous SFace engine used only by the headless full-pipeline benchmark.
+/// The deterministic in-memory gallery models the same cosine scan used after
+/// SQLite identities have been loaded, without reading or mutating user data.
+pub struct SFacePipelineBenchmarkEngine {
+    engine: FaceEmbeddingEngine,
+    gallery: Vec<Vec<f32>>,
+}
+
+impl SFacePipelineBenchmarkEngine {
+    pub const GALLERY_IDENTITIES: usize = 256;
+
+    pub fn new(model_path: &Path, cache_dir: &Path) -> Result<Self, String> {
+        let engine = FaceEmbeddingEngine::new(model_path, cache_dir)?;
+        let gallery = (0..Self::GALLERY_IDENTITIES)
+            .map(|identity| {
+                let values = (0..128)
+                    .map(|dimension| {
+                        let value = ((identity * 73 + dimension * 29 + 17) % 257) as f32;
+                        value - 128.0
+                    })
+                    .collect::<Vec<_>>();
+                normalize_embedding(&values)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { engine, gallery })
+    }
+
+    pub fn embed(&mut self, input: Vec<f32>) -> Result<Vec<f32>, String> {
+        self.engine.embed(input)
+    }
+
+    pub fn match_embedding(&self, embedding: &[f32]) -> f32 {
+        self.gallery
+            .iter()
+            .map(|candidate| cosine_similarity(candidate, embedding))
+            .max_by(f32::total_cmp)
+            .unwrap_or(0.0)
+    }
+
+    pub fn gallery_size(&self) -> usize {
+        self.gallery.len()
+    }
+}
+
 /// Benchmarks the same Core ML-backed SFace inference path used by the live camera.
 /// Input allocation and camera/alignment work are intentionally outside the timed region.
 pub fn benchmark_sface_coreml(
